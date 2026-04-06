@@ -1,7 +1,7 @@
 [project]
 name = "prosperity3"
 version = "0.0.0"
-requires-python = ">=3.12, <3.13"
+requires-python = ">=3.12"
 dependencies = [
     "jsonpickle>=4.0.2",
     "numpy>=2.2.3",

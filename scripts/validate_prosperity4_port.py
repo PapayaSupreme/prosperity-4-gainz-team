@@ -10,7 +10,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from prosperity4.algorithms.datamodel import Listing, Observation, OrderDepth, Trade, TradingState
-from prosperity4.algorithms.hybrid import Trader
+from scripts.hybrid import Trader
 from prosperity4.analysis.data import read_tutorial_prices, read_tutorial_trades
 
 
