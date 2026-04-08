@@ -1,3 +1,4 @@
+#emerald changed: take_edge, inventory_kew descreased, passive_clip and size increased
 import json
 from abc import abstractmethod
 from math import ceil, floor, sqrt
@@ -209,8 +210,8 @@ class EmeraldsMarketMaker(Strategy):
         super().__init__(symbol, limit)
         self.anchor = 10_000 #static mid price value
         self.take_edge = 1 # difference threshold after which mid price is clearly underpriced
-        self.inventory_skew = 0.125 # this * max_inventory = spread of emerald
-        self.passive_clip = 24
+        self.inventory_skew = 0.05 # this * max_inventory = spread of emerald
+        self.passive_clip = 36 # max between that - position // 2 and 8 will be the quote
 
     def act(self, state: TradingState) -> None:
         depth = state.order_depths[self.symbol]
@@ -225,7 +226,7 @@ class EmeraldsMarketMaker(Strategy):
         for ask_price, ask_volume in sell_orders:
             if buy_left <= 0 or ask_price > self.anchor - self.take_edge:
                 break
-            size = min(buy_left, -ask_volume, 16)
+            size = min(buy_left, -ask_volume, 20)
             self.buy(ask_price, size)
             buy_left -= size
 
@@ -233,7 +234,7 @@ class EmeraldsMarketMaker(Strategy):
         for bid_price, bid_volume in buy_orders:
             if sell_left <= 0 or bid_price < self.anchor + self.take_edge:
                 break
-            size = min(sell_left, bid_volume, 16)
+            size = min(sell_left, bid_volume, 20)
             self.sell(bid_price, size)
             sell_left -= size
 

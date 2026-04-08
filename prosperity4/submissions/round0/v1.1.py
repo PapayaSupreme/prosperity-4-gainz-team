@@ -1,3 +1,4 @@
+#inventory skew was 0.08 for emeralds and 0.06 for tomatoes, edge was 2 for emeralds and alpha was 0.08 for tomatoes.
 import json
 from abc import abstractmethod
 from math import ceil, floor, sqrt

@@ -1,3 +1,4 @@
+#inventory skew was 0.08 for emeralds and 0.06 for tomatoes, edge was 2 for emeralds and alpha was 0.08 for tomatoes.
 import json
 from abc import abstractmethod
 from math import ceil, floor, sqrt
@@ -208,8 +209,8 @@ class EmeraldsMarketMaker(Strategy):
     def __init__(self, symbol: Symbol, limit: int) -> None:
         super().__init__(symbol, limit)
         self.anchor = 10_000 #static mid price value
-        self.take_edge = 1 # difference threshold after which mid price is clearly underpriced
-        self.inventory_skew = 0.125 # this * max_inventory = spread of emerald
+        self.take_edge = 2 # difference threshold after which mid price is clearly underpriced
+        self.inventory_skew = 0.08
         self.passive_clip = 24
 
     def act(self, state: TradingState) -> None:

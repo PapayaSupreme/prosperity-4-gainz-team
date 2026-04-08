@@ -1,3 +1,4 @@
+#emerald changed: take_edge, inventory_kew descreased, passive_clip and size increased
 import json
 from abc import abstractmethod
 from math import ceil, floor, sqrt
@@ -209,8 +210,9 @@ class EmeraldsMarketMaker(Strategy):
         super().__init__(symbol, limit)
         self.anchor = 10_000 #static mid price value
         self.take_edge = 1 # difference threshold after which mid price is clearly underpriced
-        self.inventory_skew = 0.125 # this * max_inventory = spread of emerald
-        self.passive_clip = 24
+        self.inventory_skew = 0.05 # this * max_inventory = spread of emerald
+        self.passive_clip = 34 # max between that - position // 2 and 8 will be the quote
+        self.aggressive_clip = 22
 
     def act(self, state: TradingState) -> None:
         depth = state.order_depths[self.symbol]
@@ -222,18 +224,31 @@ class EmeraldsMarketMaker(Strategy):
         sell_left = self.limit + position
 
         # Aggressively take asks only when price is clearly cheap vs the fixed 10k anchor
+        best_bid = buy_orders[0][0]
+        best_ask = sell_orders[0][0]
+        spread = best_ask - best_bid
+
+        recent_flow = 0
+        for trade in state.market_trades.get(self.symbol, [])[-8:]:
+            if trade.price > self.anchor:
+                recent_flow += trade.quantity
+            elif trade.price < self.anchor:
+                recent_flow -= trade.quantity
+        flow_bias = max(-1.0, min(1.0, recent_flow / 40))
+
+        take_edge = self.take_edge + (1 if spread >= 4 else 0)
         for ask_price, ask_volume in sell_orders:
-            if buy_left <= 0 or ask_price > self.anchor - self.take_edge:
+            if buy_left <= 0 or ask_price > self.anchor - take_edge:
                 break
-            size = min(buy_left, -ask_volume, 16)
+            size = min(buy_left, -ask_volume, self.aggressive_clip)
             self.buy(ask_price, size)
             buy_left -= size
 
         # Symmetric aggressive sells when bids are rich vs anchor
         for bid_price, bid_volume in buy_orders:
-            if sell_left <= 0 or bid_price < self.anchor + self.take_edge:
+            if sell_left <= 0 or bid_price < self.anchor + take_edge:
                 break
-            size = min(sell_left, bid_volume, 16)
+            size = min(sell_left, bid_volume, self.aggressive_clip)
             self.sell(bid_price, size)
             sell_left -= size
 
@@ -252,16 +267,31 @@ class EmeraldsMarketMaker(Strategy):
         bid_quote = floor(reservation - half_width)
         ask_quote = ceil(reservation + half_width)
 
+        # Queue-jump one tick when safe, inspired by wall-based overbidding/underbidding.
+        for bid_price, bid_volume in buy_orders:
+            if bid_price < self.anchor and bid_volume >= 4:
+                bid_quote = max(bid_quote, bid_price + 1)
+                break
+        for ask_price, ask_volume in sell_orders:
+            if ask_price > self.anchor and -ask_volume >= 4:
+                ask_quote = min(ask_quote, ask_price - 1)
+                break
+
         # Never cross the inside unintentionally; remain passive when posting quotes.
         bid_quote = min(bid_quote, best_ask - 1)
         ask_quote = max(ask_quote, best_bid + 1)
 
         # Reduce passive size as inventory grows to limit directional exposure.
         quote_size = max(8, self.passive_clip - abs(position) // 2)
+        if abs(position) > 56:
+            quote_size = max(6, quote_size - 8)
 
-        if buy_left > 0:
+        can_post_bid = position < 72
+        can_post_ask = position > -72
+
+        if buy_left > 0 and can_post_bid:
             self.buy(bid_quote, min(buy_left, quote_size))
-        if sell_left > 0:
+        if sell_left > 0 and can_post_ask:
             self.sell(ask_quote, min(sell_left, quote_size))
 
 
@@ -269,10 +299,14 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
     def __init__(self, symbol: Symbol, limit: int) -> None:
         super().__init__(symbol, limit)
         self.ema_mid: float | None = None
+        self.fast_ema_mid: float | None = None
         self.prev_mid: float | None = None
         self.returns: list[float] = []
-        self.alpha = 0.08
-        self.inventory_skew = 0.06
+        self.alpha = 0.12
+        self.fast_alpha = 0.26
+        self.inventory_skew = 0.1
+        self.adverse_fill_bias = 0.0
+        self.last_own_trade_ts = -1
 
     def _rolling_vol(self) -> float:
         if len(self.returns) < 8:
@@ -281,6 +315,28 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         var = sum((ret - mean) ** 2 for ret in self.returns) / len(self.returns)
         # Floor volatility so thresholds never collapse to zero in quiet windows.
         return max(1.0, sqrt(var))
+
+    def _update_fill_bias(self, state: TradingState) -> None:
+        signed_volume = 0
+        latest_ts = self.last_own_trade_ts
+
+        for trade in state.own_trades.get(self.symbol, []):
+            if trade.timestamp <= self.last_own_trade_ts:
+                continue
+            latest_ts = max(latest_ts, trade.timestamp)
+            if trade.buyer == "SUBMISSION":
+                signed_volume += trade.quantity
+            elif trade.seller == "SUBMISSION":
+                signed_volume -= trade.quantity
+
+        self.last_own_trade_ts = latest_ts
+        if signed_volume == 0:
+            self.adverse_fill_bias *= 0.9
+            return
+
+        normalized = max(-1.0, min(1.0, signed_volume / self.limit))
+        # Persistent one-sided fills are usually adverse; fade that side for a few steps.
+        self.adverse_fill_bias = 0.75 * self.adverse_fill_bias + 0.25 * normalized
 
     def act(self, state: TradingState) -> None:
         depth = state.order_depths[self.symbol]
@@ -302,11 +358,17 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
             # EMA is a slow anchor fair value that adapts to drift.
             self.ema_mid = (1 - self.alpha) * self.ema_mid + self.alpha * mid
 
+        if self.fast_ema_mid is None:
+            self.fast_ema_mid = mid
+        else:
+            self.fast_ema_mid = (1 - self.fast_alpha) * self.fast_ema_mid + self.fast_alpha * mid
+
         if self.prev_mid is not None:
             self.returns.append(mid - self.prev_mid)
             if len(self.returns) > 80:
                 self.returns.pop(0)
         self.prev_mid = mid
+        self._update_fill_bias(state)
 
         total_top_depth = best_bid_volume + best_ask_volume
         imbalance = 0.0
@@ -320,53 +382,70 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
             microprice = (best_ask * best_bid_volume + best_bid * best_ask_volume) / total_top_depth
 
         rolling_vol = self._rolling_vol()
-        # Blend slower EMA and faster microprice to get a robust but reactive fair value.
-        fair_value = 0.6 * self.ema_mid + 0.4 * microprice
-        # Directional tilt from order-book pressure and short-term momentum.
-        signal = imbalance * 1.5 + 0.25 * (mid - self.ema_mid)
-        # Inventory skew shifts quotes away from current exposure.
-        reservation = fair_value + signal - self.inventory_skew * position
+        slow_mid = self.ema_mid if self.ema_mid is not None else mid
+        fast_mid = self.fast_ema_mid if self.fast_ema_mid is not None else mid
+        trend = fast_mid - slow_mid
+        high_vol = rolling_vol > 2.2
+
+        # Blend slower/robust and faster/reactive components, then add trend tilt.
+        fair_value = 0.45 * slow_mid + 0.55 * microprice + 0.5 * trend
+        imbalance_weight = 2.0 if high_vol else 1.4
+        signal = imbalance * imbalance_weight + 0.35 * trend
+        # Fill bias and inventory skew dampen getting run over in one-way regimes.
+        reservation = fair_value + signal - self.inventory_skew * position - 0.8 * self.adverse_fill_bias * rolling_vol
 
         # Higher volatility demands more edge before crossing the spread.
-        take_threshold = max(1.0, 0.8 * rolling_vol)
+        take_threshold = max(1.0, (0.9 if high_vol else 0.6) * rolling_vol)
+        aggressive_clip = 14 if high_vol else 10
 
         for ask_price, ask_volume_raw in sell_orders:
             if buy_remaining <= 0 or ask_price > reservation - take_threshold:
                 break
-            size = min(buy_remaining, -ask_volume_raw, 12)
+            size = min(buy_remaining, -ask_volume_raw, aggressive_clip)
             self.buy(ask_price, size)
             buy_remaining -= size
 
         for bid_price, bid_volume in buy_orders:
             if sell_remaining <= 0 or bid_price < reservation + take_threshold:
                 break
-            size = min(sell_remaining, bid_volume, 12)
+            size = min(sell_remaining, bid_volume, aggressive_clip)
             self.sell(bid_price, size)
             sell_remaining -= size
 
         spread = best_ask - best_bid
         # Widen passive quotes when realized volatility increases.
-        half_width = max(1.0, min(4.0, spread / 2 + 0.3 * rolling_vol))
+        half_width = max(1.0, min(5.0, spread / 2 + 0.35 * rolling_vol + (0.8 if high_vol else 0.0)))
 
-        bid_quote = floor(reservation - half_width)
-        ask_quote = ceil(reservation + half_width)
+        bid_side_penalty = 1.0 if self.adverse_fill_bias > 0.2 else 0.0
+        ask_side_penalty = 1.0 if self.adverse_fill_bias < -0.2 else 0.0
+
+        bid_quote = floor(reservation - half_width - bid_side_penalty)
+        ask_quote = ceil(reservation + half_width + ask_side_penalty)
         bid_quote = min(bid_quote, best_ask - 1)
         ask_quote = max(ask_quote, best_bid + 1)
 
         # Post less size in one-sided books or when inventory is already extended.
-        base_size = 18 if abs(imbalance) < 0.2 else 12
-        quote_size = max(6, base_size - abs(position) // 8)
+        base_size = 22 if abs(imbalance) < 0.2 else 14
+        if high_vol:
+            base_size -= 2
+        quote_size = max(6, base_size - abs(position) // 6)
 
-        if buy_remaining > 0:
+        can_post_bid = position < 70
+        can_post_ask = position > -70
+
+        if buy_remaining > 0 and can_post_bid:
             self.buy(bid_quote, min(buy_remaining, quote_size))
-        if sell_remaining > 0:
+        if sell_remaining > 0 and can_post_ask:
             self.sell(ask_quote, min(sell_remaining, quote_size))
 
     def save(self) -> JSON:
         return {
             "ema_mid": self.ema_mid,
+            "fast_ema_mid": self.fast_ema_mid,
             "prev_mid": self.prev_mid,
             "returns": self.returns,
+            "adverse_fill_bias": self.adverse_fill_bias,
+            "last_own_trade_ts": self.last_own_trade_ts,
         }
 
     def load(self, data: JSON) -> None:
@@ -377,6 +456,10 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         if isinstance(ema_mid, (int, float)):
             self.ema_mid = float(ema_mid)
 
+        fast_ema_mid = data.get("fast_ema_mid")
+        if isinstance(fast_ema_mid, (int, float)):
+            self.fast_ema_mid = float(fast_ema_mid)
+
         prev_mid = data.get("prev_mid")
         if isinstance(prev_mid, (int, float)):
             self.prev_mid = float(prev_mid)
@@ -384,6 +467,14 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         returns = data.get("returns")
         if isinstance(returns, list):
             self.returns = [float(value) for value in returns][-80:]
+
+        adverse_fill_bias = data.get("adverse_fill_bias")
+        if isinstance(adverse_fill_bias, (int, float)):
+            self.adverse_fill_bias = float(adverse_fill_bias)
+
+        last_own_trade_ts = data.get("last_own_trade_ts")
+        if isinstance(last_own_trade_ts, int):
+            self.last_own_trade_ts = last_own_trade_ts
 
 
 class Trader:

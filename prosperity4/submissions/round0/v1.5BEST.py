@@ -1,3 +1,4 @@
+#emerald changed: take_edge, inventory_kew descreased, passive_clip and size increased
 import json
 from abc import abstractmethod
 from math import ceil, floor, sqrt
@@ -207,62 +208,145 @@ class StatefulStrategy(Strategy):
 class EmeraldsMarketMaker(Strategy):
     def __init__(self, symbol: Symbol, limit: int) -> None:
         super().__init__(symbol, limit)
-        self.anchor = 10_000 #static mid price value
-        self.take_edge = 1 # difference threshold after which mid price is clearly underpriced
-        self.inventory_skew = 0.125 # this * max_inventory = spread of emerald
-        self.passive_clip = 24
+        self.fair_value = 10_000
+
+        # Hard thresholds for a product with fixed fair value.
+        self.take_buy_price = 9_999   # buy anything cheaper than fair
+        self.take_sell_price = 10_001 # sell anything richer than fair
+
+        # Inventory bands.
+        self.soft_pos = 40
+        self.hard_pos = 70
 
     def act(self, state: TradingState) -> None:
         depth = state.order_depths[self.symbol]
-        buy_orders = sorted(depth.buy_orders.items(), reverse=True)
-        sell_orders = sorted(depth.sell_orders.items())
+        buy_orders = sorted(depth.buy_orders.items(), reverse=True)   # highest bid first
+        sell_orders = sorted(depth.sell_orders.items())               # lowest ask first
 
         position = state.position.get(self.symbol, 0)
+
         buy_left = self.limit - position
         sell_left = self.limit + position
 
-        # Aggressively take asks only when price is clearly cheap vs the fixed 10k anchor
+        # ============================================================
+        # 1) TAKE OBVIOUS MISPRICINGS AROUND KNOWN FAIR = 10000
+        # ============================================================
+
+        # Buy all asks <= 9999, subject to position limit.
         for ask_price, ask_volume in sell_orders:
-            if buy_left <= 0 or ask_price > self.anchor - self.take_edge:
+            if buy_left <= 0 or ask_price > self.take_buy_price:
                 break
-            size = min(buy_left, -ask_volume, 16)
+            size = min(buy_left, -ask_volume)
             self.buy(ask_price, size)
             buy_left -= size
+            position += size
 
-        # Symmetric aggressive sells when bids are rich vs anchor
+        # Sell all bids >= 10001, subject to position limit.
         for bid_price, bid_volume in buy_orders:
-            if sell_left <= 0 or bid_price < self.anchor + self.take_edge:
+            if sell_left <= 0 or bid_price < self.take_sell_price:
                 break
-            size = min(sell_left, bid_volume, 16)
+            size = min(sell_left, bid_volume)
             self.sell(bid_price, size)
             sell_left -= size
+            position -= size
+
+        # Recompute remaining capacity after aggressive fills.
+        buy_left = self.limit - position
+        sell_left = self.limit + position
 
         if buy_left <= 0 and sell_left <= 0:
             return
 
         best_bid = buy_orders[0][0]
         best_ask = sell_orders[0][0]
-        spread = best_ask - best_bid
 
-        # ensure reservation matches current inventory short / long
-        reservation = self.anchor - self.inventory_skew * position
-        # Keep a bounded quote width: tight in normal markets, wider when spread opens.
-        half_width = max(1.0, min(3.0, spread / 2))
+        # ============================================================
+        # 2) PASSIVE QUOTING: SIMPLE, DISCRETE, INVENTORY-AWARE
+        # ============================================================
 
-        bid_quote = floor(reservation - half_width)
-        ask_quote = ceil(reservation + half_width)
+        # Default idea:
+        # - improve best bid by 1 tick if still below fair
+        # - improve best ask by 1 tick if still above fair
+        bid_quote = min(best_bid + 1, self.fair_value - 1)
+        ask_quote = max(best_ask - 1, self.fair_value + 1)
 
-        # Never cross the inside unintentionally; remain passive when posting quotes.
+        # Safety: never cross.
         bid_quote = min(bid_quote, best_ask - 1)
         ask_quote = max(ask_quote, best_bid + 1)
 
-        # Reduce passive size as inventory grows to limit directional exposure.
-        quote_size = max(8, self.passive_clip - abs(position) // 2)
+        # Inventory-dependent quote size and aggressiveness.
+        if abs(position) < self.soft_pos:
+            bid_size = min(buy_left, 32)
+            ask_size = min(sell_left, 32)
 
-        if buy_left > 0:
-            self.buy(bid_quote, min(buy_left, quote_size))
-        if sell_left > 0:
-            self.sell(ask_quote, min(sell_left, quote_size))
+        elif abs(position) < self.hard_pos:
+            bid_size = min(buy_left, 20)
+            ask_size = min(sell_left, 20)
+
+            # Lean away from current inventory.
+            if position > 0:
+                # long -> less aggressive on bid, more aggressive on ask
+                bid_quote = min(best_bid, self.fair_value - 1)
+                ask_quote = max(best_bid + 1, self.fair_value + 1)
+            elif position < 0:
+                # short -> more aggressive on bid, less aggressive on ask
+                bid_quote = min(best_ask - 1, self.fair_value - 1)
+                ask_quote = max(best_ask, self.fair_value + 1)
+
+        else:
+            # Very stretched inventory: strongly prioritize flattening.
+            bid_size = min(buy_left, 12)
+            ask_size = min(sell_left, 12)
+
+            if position > 0:
+                # very long -> stop competing on bid, sell more aggressively
+                bid_size = 0
+                ask_quote = max(best_bid + 1, self.fair_value)
+                ask_size = min(sell_left, 40)
+
+            elif position < 0:
+                # very short -> stop competing on ask, buy more aggressively
+                ask_size = 0
+                bid_quote = min(best_ask - 1, self.fair_value)
+                bid_size = min(buy_left, 40)
+
+        # ============================================================
+        # 3) OPTIONAL INVENTORY FLATTENING AT FAIR WHEN BOOK TOUCHES IT
+        # ============================================================
+
+        # If fair is directly tradable and we are imbalanced, use it.
+        if position > 0 and sell_left > 0:
+            for bid_price, bid_volume in buy_orders:
+                if bid_price == self.fair_value:
+                    size = min(position, sell_left, bid_volume)
+                    if size > 0:
+                        self.sell(bid_price, size)
+                        sell_left -= size
+                        position -= size
+                    break
+
+        elif position < 0 < buy_left:
+            for ask_price, ask_volume in sell_orders:
+                if ask_price == self.fair_value:
+                    size = min(-position, buy_left, -ask_volume)
+                    if size > 0:
+                        self.buy(ask_price, size)
+                        buy_left -= size
+                        position += size
+                    break
+
+        # Recompute after any flattening.
+        buy_left = self.limit - position
+        sell_left = self.limit + position
+
+        # ============================================================
+        # 4) POST PASSIVE ORDERS
+        # ============================================================
+        if buy_left > 0 and 'bid_size' in locals() and bid_size > 0:
+            self.buy(bid_quote, min(buy_left, bid_size))
+
+        if sell_left > 0 and 'ask_size' in locals() and ask_size > 0:
+            self.sell(ask_quote, min(sell_left, ask_size))
 
 
 class TomatoesAdaptiveMarketMaker(StatefulStrategy):

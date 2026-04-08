@@ -1,3 +1,4 @@
+#tomato changed: alpha, inventiry, microprice percentage, base quote size increased
 import json
 from abc import abstractmethod
 from math import ceil, floor, sqrt
@@ -209,8 +210,8 @@ class EmeraldsMarketMaker(Strategy):
         super().__init__(symbol, limit)
         self.anchor = 10_000 #static mid price value
         self.take_edge = 1 # difference threshold after which mid price is clearly underpriced
-        self.inventory_skew = 0.125 # this * max_inventory = spread of emerald
-        self.passive_clip = 24
+        self.inventory_skew = 0.05 # this * max_inventory = spread of emerald
+        self.passive_clip = 36 # max between that - position // 2 and 8 will be the quote
 
     def act(self, state: TradingState) -> None:
         depth = state.order_depths[self.symbol]
@@ -225,7 +226,7 @@ class EmeraldsMarketMaker(Strategy):
         for ask_price, ask_volume in sell_orders:
             if buy_left <= 0 or ask_price > self.anchor - self.take_edge:
                 break
-            size = min(buy_left, -ask_volume, 16)
+            size = min(buy_left, -ask_volume, 20)
             self.buy(ask_price, size)
             buy_left -= size
 
@@ -233,7 +234,7 @@ class EmeraldsMarketMaker(Strategy):
         for bid_price, bid_volume in buy_orders:
             if sell_left <= 0 or bid_price < self.anchor + self.take_edge:
                 break
-            size = min(sell_left, bid_volume, 16)
+            size = min(sell_left, bid_volume, 20)
             self.sell(bid_price, size)
             sell_left -= size
 
@@ -271,8 +272,8 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         self.ema_mid: float | None = None
         self.prev_mid: float | None = None
         self.returns: list[float] = []
-        self.alpha = 0.08
-        self.inventory_skew = 0.06
+        self.alpha = 0.12
+        self.inventory_skew = 0.08
 
     def _rolling_vol(self) -> float:
         if len(self.returns) < 8:
@@ -321,7 +322,7 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
 
         rolling_vol = self._rolling_vol()
         # Blend slower EMA and faster microprice to get a robust but reactive fair value.
-        fair_value = 0.6 * self.ema_mid + 0.4 * microprice
+        fair_value = 0.5 * self.ema_mid + 0.5 * microprice
         # Directional tilt from order-book pressure and short-term momentum.
         signal = imbalance * 1.5 + 0.25 * (mid - self.ema_mid)
         # Inventory skew shifts quotes away from current exposure.
@@ -333,14 +334,14 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         for ask_price, ask_volume_raw in sell_orders:
             if buy_remaining <= 0 or ask_price > reservation - take_threshold:
                 break
-            size = min(buy_remaining, -ask_volume_raw, 12)
+            size = min(buy_remaining, -ask_volume_raw, 16)
             self.buy(ask_price, size)
             buy_remaining -= size
 
         for bid_price, bid_volume in buy_orders:
             if sell_remaining <= 0 or bid_price < reservation + take_threshold:
                 break
-            size = min(sell_remaining, bid_volume, 12)
+            size = min(sell_remaining, bid_volume, 16)
             self.sell(bid_price, size)
             sell_remaining -= size
 

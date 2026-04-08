@@ -55,3 +55,7 @@ Treat `submissions/` as immutable history.
 - Upload-ready single file snapshot: `prosperity4/submissions/round1.py`
 - Tutorial notebook starter: `prosperity4/analysis/round0_tutorial.ipynb`
 - Tutorial data helpers: `prosperity4/analysis/data.py`
+
+## VISUALIZER ONCE UPLOADED
+
+https://kevin-fu1.github.io/imc-prosperity-4-visualizer/
