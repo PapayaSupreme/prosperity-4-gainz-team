@@ -192,3 +192,4 @@ pyrightconfig.json
 
 # Submission and end-of-round logs
 !/logs/*.log
+.idea
