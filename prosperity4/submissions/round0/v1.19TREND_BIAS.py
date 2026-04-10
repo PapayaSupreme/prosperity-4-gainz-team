@@ -418,7 +418,6 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
             pos_count = sum(d > 0 for d in diffs)
             neg_count = sum(d < 0 for d in diffs)
 
-            trend_bias = 0
             if pos_count >= 2 or neg_count >= 2:
                 trend_bias = sum(diffs) / 3
 
@@ -441,9 +440,15 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         # 1) TAKE OBVIOUS MISPRICINGS AROUND ESTIMATED FAIR VALUE
         # ============================================================
 
-        # Take thresholds around current fair value.
-        take_buy_price = fair_value - 1
-        take_sell_price = fair_value + 1
+        # Take thresholds around current fair value, taking into account trend bias.
+        take_buy_price = fair_value - 1 # THE HIGHER, THE EASIER. THIS IS THE PRICE I WANT TO BUY MY STOCK FOR
+        take_sell_price = fair_value + 1 # THE LOWER, THE EASIER. THIS IS THE PRICE I WANT TO SELL MY STOCK FOR
+        if trend_bias > 0: # market is up, expect a reversion, harder to buy, bid price--
+            take_buy_price -= 1
+            take_sell_price -= 1
+        elif trend_bias < 0: # market is down, expect a reversion, harder to sell, ask price++
+            take_buy_price += 1
+            take_sell_price += 1
 
         buy_left, position = self._take_sell_levels(sell_orders, buy_left, position, take_buy_price)
         sell_left, position = self._take_buy_levels(buy_orders, sell_left, position, take_sell_price)
@@ -459,7 +464,7 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         best_ask = sell_orders[0][0]
 
         # ============================================================
-        # 2) PASSIVE QUOTING: SIMPLE, INVENTORY-AWARE (like Emeralds)
+        # 2) PASSIVE QUOTING
         # ============================================================
 
         # Default: improve best bid/ask by 1 tick, stay near fair value.
