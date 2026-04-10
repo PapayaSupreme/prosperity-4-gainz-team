@@ -1,4 +1,4 @@
-# from v1.10: fair price of tomatoes is now current_mid - k * (current_mid - previous_mid)
+# from v1.13: tomato fair uses adaptive mean-reversion strength from recent reversal rate
 
 import json
 from abc import abstractmethod
@@ -354,7 +354,16 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         super().__init__(symbol, limit)
         self.fair_value: float | None = None
         self.prev_mid: float | None = None
-        self.k = 0.4 #coeff of mean reversion
+
+        # Fallback and bounds for adaptive mean-reversion strength.
+        self.k_fallback = 0.4
+        self.k_min = 0.0
+        self.k_max = 0.8
+
+        # Keep a short rolling history of deltas to estimate reversal probability.
+        self.delta_history: list[float] = []
+        self.reversal_window = 40
+        self.k_current = self.k_fallback
 
         # Inventory bands (same as Emeralds).
         self.soft_pos = 40
@@ -363,7 +372,35 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
     def _estimate_fair_value(self, current_mid: float) -> float:
         if self.prev_mid is None:
             return current_mid
-        return current_mid - self.k * (current_mid - self.prev_mid)
+
+        current_delta = current_mid - self.prev_mid
+
+        # Update rolling delta history for reversal-rate estimation.
+        self.delta_history.append(current_delta)
+        if len(self.delta_history) > self.reversal_window:
+            self.delta_history.pop(0)
+
+        k_dynamic = self.k_fallback
+
+        # Count sign flips (excluding zero deltas) as reversals.
+        if len(self.delta_history) >= 2:
+            reversals = 0
+            comparable_pairs = 0
+
+            for prev_delta, next_delta in zip(self.delta_history[:-1], self.delta_history[1:]):
+                if prev_delta == 0 or next_delta == 0:
+                    continue
+                comparable_pairs += 1
+                if prev_delta * next_delta < 0:
+                    reversals += 1
+
+            if comparable_pairs >= 5:
+                reversal_rate = reversals / comparable_pairs
+                # Map reversal probability p to k via k = 2p - 1, then clamp.
+                k_dynamic = max(self.k_min, min(self.k_max, 2 * reversal_rate - 1))
+
+        self.k_current = k_dynamic
+        return current_mid - k_dynamic * current_delta
 
     def act(self, state: TradingState) -> None:
         depth = state.order_depths[self.symbol]
@@ -483,6 +520,9 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         return {
             "fair_value": self.fair_value,
             "prev_mid": self.prev_mid,
+            # Persist adaptive state so behavior is stable across ticks.
+            "delta_history": self.delta_history,
+            "k_current": self.k_current,
         }
 
     def load(self, data: JSON) -> None:
@@ -497,6 +537,13 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         if isinstance(prev_mid, (int, float)):
             self.prev_mid = float(prev_mid)
 
+        delta_history = data.get("delta_history")
+        if isinstance(delta_history, list):
+            self.delta_history = [float(x) for x in delta_history][-self.reversal_window:]
+
+        k_current = data.get("k_current")
+        if isinstance(k_current, (int, float)):
+            self.k_current = max(self.k_min, min(self.k_max, float(k_current)))
 
 
 class Trader:
