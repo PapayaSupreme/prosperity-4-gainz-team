@@ -406,23 +406,21 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         current_mid = (best_bid + best_ask) / 2
 
         self.prev_mid_prices.append(current_mid)
-        if len(self.prev_mid_prices) > 20:
+        if len(self.prev_mid_prices) > 10:
             self.prev_mid_prices.pop(0)
 
         # Simple trend: last 4 mids increasing or decreasing
         trend_bias = 0
         if len(self.prev_mid_prices) >= 4:
             last_4 = self.prev_mid_prices[-4:]
-            if all(last_4[i] > last_4[i + 1] for i in range(3)): # downtrending
-                mean_trend = 0
-                for i in range(3):
-                    mean_trend += last_4[i] - last_4[i + 1]
-                trend_bias = - mean_trend / 3
-            elif all(last_4[i] < last_4[i + 1] for i in range(3)): #uptrending
-                mean_trend = 0
-                for i in range(3, 0, -1):
-                    mean_trend += last_4[i] - last_4[i - 1]
-                trend_bias = mean_trend / 3
+            diffs = [last_4[i + 1] - last_4[i] for i in range(3)]
+
+            pos_count = sum(d > 0 for d in diffs)
+            neg_count = sum(d < 0 for d in diffs)
+
+            trend_bias = 0
+            if pos_count >= 2 or neg_count >= 2:
+                trend_bias = sum(diffs) / 3
 
         # Microprice weights prices by opposite-side top-of-book volume.
         best_bid_vol = max(0, buy_orders[0][1])
@@ -468,7 +466,7 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         fair_int = int(fair_value - trend_bias) # mean reversion trend bias : if > 0 then it'll go down so we substract
         bid_quote = min(best_bid + 1, fair_int - 1)
         ask_quote = max(best_ask - 1, fair_int + 1)
-    
+
         # Safety: never cross.
         bid_quote = min(bid_quote, best_ask - 1)
         ask_quote = max(ask_quote, best_bid + 1)
