@@ -389,7 +389,9 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         self.prev_microprice: float | None = None
         self.prev_mid_prices = []
         self.k = 0.3 #coeff of mean reversion
-        self.passive_clip = 40
+        self.passive_clip = 20
+        self.soft_pos = 40
+        self.hard_pos = 70
 
     def _estimate_fair_value(self, microprice: float) -> float:
         if self.prev_microprice is None:
@@ -477,20 +479,51 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         bid_quote = min(bid_quote, best_ask - 1)
         ask_quote = max(ask_quote, best_bid + 1)
 
-        # Base quote size
-        base_bid_size = min(buy_left, self.passive_clip)
-        base_ask_size = min(sell_left, self.passive_clip)
+        # ============================================================
+        # 2) PASSIVE QUOTING
+        # ============================================================
 
-        # Adjust based on trend
-        if trend_bias > 0:
-            bid_size = max(base_bid_size // 2, 6)  # buy less
-            ask_size = base_ask_size  # sell more
-        elif trend_bias < 0:
-            bid_size = base_bid_size  # buy more
-            ask_size = max(base_ask_size // 2, 6)  # sell less
+        fair_int = int(fair_value - trend_bias)
+        bid_quote = min(best_bid + 1, fair_int - 1)
+        ask_quote = max(best_ask - 1, fair_int + 1)
+
+        # Safety: never cross.
+        bid_quote = min(bid_quote, best_ask - 1)
+        ask_quote = max(ask_quote, best_bid + 1)
+
+        # -------------------------
+        # Inventory-aware base sizes
+        # -------------------------
+        if abs(position) < self.soft_pos:
+            bid_size = min(buy_left, 20)
+            ask_size = min(sell_left, 20)
+
+        elif abs(position) < self.hard_pos:
+            bid_size = min(buy_left, 12)
+            ask_size = min(sell_left, 12)
+
+            # Lean away from current inventory
+            if position > 0:
+                bid_size = max(bid_size // 2, 0)
+            elif position < 0:
+                ask_size = max(ask_size // 2, 0)
+
         else:
-            bid_size = base_bid_size
-            ask_size = base_ask_size
+            # Very stretched inventory: prioritize flattening
+            if position > 0:
+                bid_size = 0
+                ask_size = min(sell_left, 30)
+            else:
+                ask_size = 0
+                bid_size = min(buy_left, 30)
+
+        # -------------------------
+        # Then apply trend as a tilt
+        # -------------------------
+        if trend_bias > 0:
+            bid_size = max(int(bid_size * 0.7), 0)
+        elif trend_bias < 0:
+            ask_size = max(int(ask_size * 0.7), 0)
 
         # ============================================================
         # 3) POST PASSIVE ORDERS
