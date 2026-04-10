@@ -354,7 +354,7 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         super().__init__(symbol, limit)
         self.fair_value: float | None = None
         self.prev_mid: float | None = None
-        self.k = 0.3 #coeff of mean reversion
+        self.k = 0.4 #coeff of mean reversion
 
         # Inventory bands (same as Emeralds).
         self.soft_pos = 40

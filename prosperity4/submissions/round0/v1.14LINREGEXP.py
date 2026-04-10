@@ -1,4 +1,4 @@
-# from v1.13: changing to linreg of past returns for tomatoes
+#from v1.13: linreg for tomato random walk estimation
 import json
 from abc import abstractmethod
 from typing import Any
@@ -353,16 +353,58 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         super().__init__(symbol, limit)
         self.fair_value: float | None = None
         self.prev_mid: float | None = None
-        self.k = 0.3 #coeff of mean reversion
+
+        # Fallback mean-reversion coeff when regression history is too short.
+        self.k = 0.3
+
+        # Recent mid-price changes for tiny linear regression on deltas.
+        self.delta_history: list[float] = []
+        self.reg_window = 8          # use last N deltas
+        self.max_pred_delta = 2.0    # clip prediction to avoid unstable quotes
 
         # Inventory bands (same as Emeralds).
         self.soft_pos = 40
         self.hard_pos = 70
 
     def _estimate_fair_value(self, current_mid: float) -> float:
+        # No previous mid yet -> nothing to estimate.
         if self.prev_mid is None:
             return current_mid
-        return current_mid - self.k * (current_mid - self.prev_mid)
+
+        current_delta = current_mid - self.prev_mid
+
+        # Update delta history first.
+        self.delta_history.append(current_delta)
+        if len(self.delta_history) > self.reg_window:
+            self.delta_history.pop(0)
+
+        # Need enough points for a meaningful regression.
+        # We regress:
+        #   delta_t = a + b * delta_{t-1}
+        # then predict next delta from current delta.
+        if len(self.delta_history) >= 5:
+            y = self.delta_history[1:]   # current deltas
+            x = self.delta_history[:-1]  # previous deltas
+
+            n = len(x)
+            mean_x = sum(x) / n
+            mean_y = sum(y) / n
+
+            var_x = sum((xi - mean_x) ** 2 for xi in x)
+            if var_x > 1e-9:
+                cov_xy = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
+                b = cov_xy / var_x
+                a = mean_y - b * mean_x
+
+                predicted_delta = a + b * current_delta
+
+                # Clip prediction so one noisy fit cannot wreck quoting.
+                predicted_delta = max(-self.max_pred_delta, min(self.max_pred_delta, predicted_delta))
+                return current_mid + predicted_delta
+
+        # Fallback: simple mean-reversion if regression history is too short
+        # or regression is degenerate.
+        return current_mid - self.k * current_delta
 
     def act(self, state: TradingState) -> None:
         depth = state.order_depths[self.symbol]
@@ -420,11 +462,12 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         best_ask = sell_orders[0][0]
 
         # ============================================================
-        # 2) PASSIVE QUOTING: SIMPLE, INVENTORY-AWARE (like Emeralds)
+        # 2) PASSIVE QUOTING: SIMPLE, INVENTORY-AWARE
         # ============================================================
 
         # Default: improve best bid/ask by 1 tick, stay near fair value.
         fair_int = int(fair_value)
+
         bid_quote = min(best_bid + 1, fair_int - 1)
         ask_quote = max(best_ask - 1, fair_int + 1)
 
@@ -482,6 +525,7 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         return {
             "fair_value": self.fair_value,
             "prev_mid": self.prev_mid,
+            "delta_history": self.delta_history,
         }
 
     def load(self, data: JSON) -> None:
@@ -495,6 +539,10 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         prev_mid = data.get("prev_mid")
         if isinstance(prev_mid, (int, float)):
             self.prev_mid = float(prev_mid)
+
+        delta_history = data.get("delta_history")
+        if isinstance(delta_history, list):
+            self.delta_history = [float(x) for x in delta_history][-self.reg_window:]
 
 
 
