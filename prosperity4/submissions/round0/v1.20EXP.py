@@ -1,4 +1,4 @@
-# from v1.18: tomato trend bias on 2/3 last diffs in mid-price
+# from v1.19: soft inventories on tomato
 
 import json
 from abc import abstractmethod
@@ -389,6 +389,7 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         self.prev_microprice: float | None = None
         self.prev_mid_prices = []
         self.k = 0.3 #coeff of mean reversion
+        self.passive_clip = 40
 
     def _estimate_fair_value(self, microprice: float) -> float:
         if self.prev_microprice is None:
@@ -477,8 +478,8 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         ask_quote = max(ask_quote, best_bid + 1)
 
         # Base quote size
-        base_bid_size = buy_left
-        base_ask_size = sell_left
+        base_bid_size = min(buy_left, self.passive_clip)
+        base_ask_size = min(sell_left, self.passive_clip)
 
         # Adjust based on trend
         if trend_bias > 0:
