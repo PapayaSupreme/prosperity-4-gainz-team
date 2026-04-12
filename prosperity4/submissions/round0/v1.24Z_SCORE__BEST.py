@@ -391,24 +391,22 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         self.ema_alpha = 0.6
         self.k = 1
         self.z_score_coeff = 1.0
-        self.z_score_window = 8
+        self.z_score_window = 16
 
     def _compute_microprice_zscore(self, microprice: float) -> float:
+        z = 0.0
+        if len(self.microprice_history) >= 4:
+            mean_ = sum(self.microprice_history) / len(self.microprice_history)
+            variance = sum((x - mean_) ** 2 for x in self.microprice_history) / len(self.microprice_history)
+            std = variance ** 0.5
+
+            if std >= 1e-6:
+                z = (microprice - mean_) / std
+
         self.microprice_history.append(microprice)
         if len(self.microprice_history) > self.z_score_window:
             self.microprice_history.pop(0)
 
-        if len(self.microprice_history) < 4:
-            return 0.0
-
-        mean_ = sum(self.microprice_history) / len(self.microprice_history)
-        variance = sum((x - mean_) ** 2 for x in self.microprice_history) / len(self.microprice_history)
-        std = variance ** 0.5
-
-        if std < 1e-6:
-            return 0.0
-
-        z = (microprice - mean_) / std
         return max(-2.0, min(2.0, z))
 
     def _estimate_fair_value(self, microprice: float, zscore: float) -> float:
