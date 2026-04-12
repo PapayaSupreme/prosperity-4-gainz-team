@@ -1,4 +1,4 @@
-# from v1.19: ema(microprice) on tomato
+# from v1.19: ema(microprice) on tomato - 15 086
 
 import json
 from abc import abstractmethod
