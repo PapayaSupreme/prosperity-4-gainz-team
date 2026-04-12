@@ -1,4 +1,4 @@
-# from v1.19: ema(microprice) on tomato
+# from v1.19: ema(microprice) balanced with pure microprice for less lag
 
 import json
 from abc import abstractmethod
