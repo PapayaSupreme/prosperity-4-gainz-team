@@ -388,11 +388,10 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         self.fair_value: float | None = None
         self.prev_microprice: float | None = None
         self.prev_mid_prices = []
-        self.k = 0.3  # coeff of mean reversion
+        self.k = 0.3 #coeff of mean reversion
         self.passive_clip = 20
         self.soft_pos = 40
         self.hard_pos = 70
-        self.imbalance_alpha = 1.0
 
     def _estimate_fair_value(self, microprice: float) -> float:
         if self.prev_microprice is None:
@@ -428,7 +427,6 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         # Microprice weights prices by opposite-side top-of-book volume.
         best_bid_vol = max(0, buy_orders[0][1])
         best_ask_vol = max(0, -sell_orders[0][1])
-
         top_vol = best_bid_vol + best_ask_vol
         microprice = (
             (best_ask * best_bid_vol + best_bid * best_ask_vol) / top_vol
@@ -438,39 +436,25 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
 
         self.fair_value = self._estimate_fair_value(microprice)
         self.prev_microprice = microprice
-        
+
         fair_value = self.fair_value if self.fair_value is not None else current_mid
 
-        # Simple imbalance in [-1, 1]
-        imbalance = (
-            (best_bid_vol - best_ask_vol) / top_vol
-            if top_vol > 0
-            else 0.0
-        )
-
-        base_fair_value = self._estimate_fair_value(microprice)
-
-        # Small bullish shift when bid side is heavier,
-        # small bearish shift when ask side is heavier.
-        fair_value = base_fair_value + self.imbalance_alpha * imbalance
-
-        self.fair_value = fair_value
-        self.prev_microprice = microprice
-
-        # ------------------------------------------------------------
+        # ============================================================
         # 1) TAKE OBVIOUS MISPRICINGS AROUND ESTIMATED FAIR VALUE
-        # ------------------------------------------------------------
+        # ============================================================
 
-        # No trend bias here. Test imbalance alone first.
-        take_buy_price = fair_value - 1
-        take_sell_price = fair_value + 1
+        # Take thresholds around current fair value, taking into account trend bias.
+        take_buy_price = fair_value - 1 # THE HIGHER, THE EASIER. THIS IS THE PRICE I WANT TO BUY MY STOCK FOR
+        take_sell_price = fair_value + 1 # THE LOWER, THE EASIER. THIS IS THE PRICE I WANT TO SELL MY STOCK FOR
+        if trend_bias > 0: # market is up, expect a reversion, harder to buy, bid price--
+            take_buy_price -= 1
+            take_sell_price -= 1
+        elif trend_bias < 0: # market is down, expect a reversion, harder to sell, ask price++
+            take_buy_price += 1
+            take_sell_price += 1
 
-        buy_left, position = self._take_sell_levels(
-            sell_orders, buy_left, position, take_buy_price
-        )
-        sell_left, position = self._take_buy_levels(
-            buy_orders, sell_left, position, take_sell_price
-        )
+        buy_left, position = self._take_sell_levels(sell_orders, buy_left, position, take_buy_price)
+        sell_left, position = self._take_buy_levels(buy_orders, sell_left, position, take_sell_price)
 
         # Recompute remaining capacity.
         buy_left = self.limit - position
@@ -482,11 +466,12 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         best_bid = buy_orders[0][0]
         best_ask = sell_orders[0][0]
 
-        # ------------------------------------------------------------
+        # ============================================================
         # 2) PASSIVE QUOTING
-        # ------------------------------------------------------------
+        # ============================================================
 
-        fair_int = int(round(fair_value))
+        # Default: improve best bid/ask by 1 tick, stay near fair value.
+        fair_int = int(fair_value - trend_bias) # mean reversion trend bias : if > 0 then it'll go down so we substract
         bid_quote = min(best_bid + 1, fair_int - 1)
         ask_quote = max(best_ask - 1, fair_int + 1)
 
@@ -494,10 +479,21 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         bid_quote = min(bid_quote, best_ask - 1)
         ask_quote = max(ask_quote, best_bid + 1)
 
-        # ------------------------------------------------------------
-        # 3) INVENTORY-AWARE SIZING
-        # ------------------------------------------------------------
+        # ============================================================
+        # 2) PASSIVE QUOTING
+        # ============================================================
 
+        fair_int = int(fair_value - trend_bias)
+        bid_quote = min(best_bid + 1, fair_int - 1)
+        ask_quote = max(best_ask - 1, fair_int + 1)
+
+        # Safety: never cross.
+        bid_quote = min(bid_quote, best_ask - 1)
+        ask_quote = max(ask_quote, best_bid + 1)
+
+        # -------------------------
+        # Inventory-aware base sizes
+        # -------------------------
         if abs(position) < self.soft_pos:
             bid_size = min(buy_left, 20)
             ask_size = min(sell_left, 20)
@@ -521,36 +517,20 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
                 ask_size = 0
                 bid_size = min(buy_left, 30)
 
-        # ------------------------------------------------------------
-        # 4) POST PASSIVE ORDERS
-        # ------------------------------------------------------------
+        # -------------------------
+        # Then apply trend as a tilt
+        # -------------------------
+        if trend_bias > 0:
+            bid_size = max(int(bid_size * 0.7), 0)
+        elif trend_bias < 0:
+            ask_size = max(int(ask_size * 0.7), 0)
 
-        self._post_passive_orders(
-            buy_left, sell_left, bid_quote, ask_quote, bid_size, ask_size
-        )
+        # ============================================================
+        # 3) POST PASSIVE ORDERS
+        # ============================================================
 
-    def save(self) -> JSON:
-        return {
-            "fair_value": self.fair_value,
-            "prev_microprice": self.prev_microprice,
-        }
+        self._post_passive_orders(buy_left, sell_left, bid_quote, ask_quote, bid_size, ask_size)
 
-    def load(self, data: JSON) -> None:
-        if not isinstance(data, dict):
-            return
-
-        fair_value = data.get("fair_value")
-        if isinstance(fair_value, (int, float)):
-            self.fair_value = float(fair_value)
-
-        prev_microprice = data.get("prev_microprice")
-        if isinstance(prev_microprice, (int, float)):
-            self.prev_microprice = float(prev_microprice)
-        else:
-            # Backward compatibility with older saved state.
-            prev_mid = data.get("prev_mid")
-            if isinstance(prev_mid, (int, float)):
-                self.prev_microprice = float(prev_mid)
     def save(self) -> JSON:
         return {
             "fair_value": self.fair_value,
