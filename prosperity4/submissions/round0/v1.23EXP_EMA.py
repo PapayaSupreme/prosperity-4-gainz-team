@@ -393,6 +393,7 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         self.ema_alpha = 0.6
 
     def _estimate_fair_value(self, microprice: float) -> float:
+        # 1) Update EMA
         if self.ema_microprice is None:
             self.ema_microprice = microprice
         else:
@@ -400,8 +401,9 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
                 self.ema_alpha * microprice
                 + (1 - self.ema_alpha) * self.ema_microprice
             )
-        # Mean-revert short-term ema microprice moves instead of raw mid moves.
-        return self.ema_microprice
+
+        # 2) Mean-revert toward EMA
+        return microprice - self.microprice_alpha * (microprice - self.ema_microprice)
 
     def act(self, state: TradingState) -> None:
         buy_orders, sell_orders = self._get_sorted_orders(state)
