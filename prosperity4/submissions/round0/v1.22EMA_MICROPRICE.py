@@ -1,5 +1,5 @@
 # 2591 - from v1.19: ema(microprice) on tomato
-# 100MC: 2024-04-12_15-39-52 - PnL: 15 086, STD: 2349, Median: 14 887
+# 100MC: 2025-04-12_15-39-52 - PnL: 15 086, STD: 2349, Median: 14 887
 # 1MC: PnL: 30 254, Sharpe: 23, Calmar: 21
 import json
 from abc import abstractmethod
