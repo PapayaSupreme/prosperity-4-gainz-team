@@ -1,4 +1,4 @@
-# 2591 - from v1.27: z_score aadded for fair value estimation
+# 2591 - from v1.27: z_score added for fair value estimation
 # 100MC: 2026-04-13_17-28-59 - PnL: 15 355, STD: 2184, Median: 15309
 # 1MC: PnL: 30 830, Sharpe: 57, Calmar: 30
 import json
@@ -389,9 +389,25 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         self.fair_value: float | None = None
         self.prev_microprice: float | None = None
         self.prev_mid_prices = []
+        self.residual_history = []
         self.microprice_alpha = 0.3
         self.ema_microprice: float | None = None
         self.ema_alpha = 0.6
+        self.z_score_coeff = 1.0
+        self.z_score_window = 8
+
+    def _compute_zscore(self, residual: float) -> float:
+        z = 0.0
+        if len(self.residual_history) >= self.z_score_window:
+            variance = sum(x * x for x in self.residual_history) / len(self.residual_history)
+            std = max(variance ** 0.5, 1e-6)
+            z = residual / std
+
+        self.residual_history.append(residual)
+        if len(self.residual_history) > self.z_score_window:
+            self.residual_history.pop(0)
+
+        return max(-2.0, min(2.0, z))
 
     def _estimate_fair_value(self, microprice: float) -> float:
         if self.ema_microprice is None:
@@ -401,8 +417,16 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
                 self.ema_alpha * microprice
                 + (1 - self.ema_alpha) * self.ema_microprice
             )
-        # Mean-revert short-term ema microprice moves instead of raw mid moves.
-        return self.ema_microprice
+
+        residual = microprice - self.ema_microprice
+
+        zscore = self._compute_zscore(residual)
+
+        if abs(zscore) < 0.5:
+            zscore = 0.0
+
+        # 4) Final fair value
+        return self.ema_microprice - self.z_score_coeff * zscore
 
     def act(self, state: TradingState) -> None:
         buy_orders, sell_orders = self._get_sorted_orders(state)
@@ -451,11 +475,11 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         take_buy_price = fair_value - 1 # THE HIGHER, THE EASIER. THIS IS THE PRICE I WANT TO BUY MY STOCK FOR
         take_sell_price = fair_value + 1 # THE LOWER, THE EASIER. THIS IS THE PRICE I WANT TO SELL MY STOCK FOR
         if trend_bias > 0: # market is up, expect a reversion, harder to buy, bid price--
-            take_buy_price -= 1
-            take_sell_price -= 1
+            take_buy_price -= max(1, round(trend_bias))
+            take_sell_price -= max(1, round(trend_bias))
         elif trend_bias < 0: # market is down, expect a reversion, harder to sell, ask price++
-            take_buy_price += 1
-            take_sell_price += 1
+            take_buy_price += max(1, round(trend_bias))
+            take_sell_price += max(1, round(trend_bias))
 
         buy_left, position = self._take_sell_levels(sell_orders, buy_left, position, take_buy_price)
         sell_left, position = self._take_buy_levels(buy_orders, sell_left, position, take_sell_price)
@@ -507,6 +531,7 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
             "fair_value": self.fair_value,
             "ema_microprice": self.ema_microprice,
             "prev_mid_prices": self.prev_mid_prices,
+
         }
 
     def load(self, data: JSON) -> None:

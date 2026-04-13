@@ -1,5 +1,5 @@
-# 2591 - from v1.22: enhanced trend, quote prices now related to it and not flat
-# 100MC: 2026-04-13_17-28-59 - PnL: 15 355, STD: 2184, Median: 15309
+# 2591 - from v1.19: ema(microprice) on tomato
+# 100MC: 2026-04-13_18-06-47 - PnL: 15 354, STD: 2184, Median: 15 308
 # 1MC: PnL: 30 830, Sharpe: 57, Calmar: 30
 import json
 from abc import abstractmethod
@@ -451,11 +451,11 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         take_buy_price = fair_value - 1 # THE HIGHER, THE EASIER. THIS IS THE PRICE I WANT TO BUY MY STOCK FOR
         take_sell_price = fair_value + 1 # THE LOWER, THE EASIER. THIS IS THE PRICE I WANT TO SELL MY STOCK FOR
         if trend_bias > 0: # market is up, expect a reversion, harder to buy, bid price--
-            take_buy_price -= 1
-            take_sell_price -= 1
+            take_buy_price -= max(1, round(trend_bias))
+            take_sell_price -= max(1, round(trend_bias))
         elif trend_bias < 0: # market is down, expect a reversion, harder to sell, ask price++
-            take_buy_price += 1
-            take_sell_price += 1
+            take_buy_price += max(1, round(trend_bias))
+            take_sell_price += max(1, round(trend_bias))
 
         buy_left, position = self._take_sell_levels(sell_orders, buy_left, position, take_buy_price)
         sell_left, position = self._take_buy_levels(buy_orders, sell_left, position, take_sell_price)
