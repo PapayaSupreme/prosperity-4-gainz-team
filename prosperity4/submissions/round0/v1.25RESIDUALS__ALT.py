@@ -1,5 +1,6 @@
-# from v1.22: ema(microprice) on tomato - 15 088
-
+# from v1.24: z_score now computed from residuals (microprice - ema) not microprice and removes its value
+# 100MC: 2026-04-12_15-34-39 - PnL: 15 097, STD: 2330, Median: 14 951
+# 1MC: PnL: 30 219, Sharpe: 39.6, Calmar: 23.2
 import json
 from abc import abstractmethod
 from typing import Any
@@ -391,9 +392,9 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         self.ema_alpha = 0.6
         self.k = 1
         self.z_score_coeff = 1.0
-        self.z_score_window = 16
+        self.z_score_window = 8
 
-    def _compute_microprice_zscore(self, microprice: float) -> float:
+    def _compute_zscore(self, residual: float) -> float:
         z = 0.0
         if len(self.microprice_history) >= 4:
             mean_ = sum(self.microprice_history) / len(self.microprice_history)
@@ -401,15 +402,15 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
             std = variance ** 0.5
 
             if std >= 1e-6:
-                z = (microprice - mean_) / std
+                z = (residual - mean_) / std
 
-        self.microprice_history.append(microprice)
+        self.microprice_history.append(residual)
         if len(self.microprice_history) > self.z_score_window:
             self.microprice_history.pop(0)
 
         return max(-2.0, min(2.0, z))
 
-    def _estimate_fair_value(self, microprice: float, zscore: float) -> float:
+    def _estimate_fair_value(self, microprice: float) -> float:
         if self.ema_microprice is None:
             self.ema_microprice = microprice
         else:
@@ -417,10 +418,18 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
                 self.ema_alpha * microprice
                 + (1 - self.ema_alpha) * self.ema_microprice
             )
-        base_fair = microprice - self.k * (microprice - self.ema_microprice)
-        return base_fair - self.z_score_coeff * zscore
-        # Mean-revert short-term ema microprice moves instead of raw mid-moves.
-        #return self.ema_microprice - zscore
+
+        # 2) Compute residual
+        residual = microprice - self.ema_microprice
+
+        # 3) Z-score on residual
+        zscore = self._compute_zscore(residual)
+
+        if abs(zscore) < 0.5:
+            zscore = 0.0
+
+        # 4) Final fair value
+        return self.ema_microprice - self.z_score_coeff * zscore
 
     def act(self, state: TradingState) -> None:
         buy_orders, sell_orders = self._get_sorted_orders(state)
@@ -441,8 +450,7 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
             else current_mid
         )
 
-        zscore = self._compute_microprice_zscore(microprice)
-        self.fair_value = self._estimate_fair_value(microprice, zscore)
+        self.fair_value = self._estimate_fair_value(microprice)
         fair_value = self.fair_value if self.fair_value is not None else current_mid
 
         # ============================================================

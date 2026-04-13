@@ -1,6 +1,6 @@
-# from v1.18: tomato trend bias on 2/3 last diffs in mid-price
-# 100MC: 2024-04-13_10-22-07 - PnL: 15 121, STD: 2314, Median: 15 077
-# 1MC: PnL: 30 186, Sharpe: 21.8, Calmar: 20.6
+# from v1.22: drift as spread skew
+# 100MC: 2024-04-12_15-39-52 - PnL: 15 086, STD: 2349, Median: 14 887
+# 1MC: PnL: 30 254, Sharpe: 23, Calmar: 21
 import json
 from abc import abstractmethod
 from typing import Any
@@ -389,13 +389,20 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         self.fair_value: float | None = None
         self.prev_microprice: float | None = None
         self.prev_mid_prices = []
-        self.k = 0.3 #coeff of mean reversion
+        self.microprice_alpha = 0.3
+        self.ema_microprice: float | None = None
+        self.ema_alpha = 0.6
 
     def _estimate_fair_value(self, microprice: float) -> float:
-        if self.prev_microprice is None:
-            return microprice
-        # Mean-revert short-term microprice moves instead of raw mid moves.
-        return microprice - self.k * (microprice - self.prev_microprice)
+        if self.ema_microprice is None:
+            self.ema_microprice = microprice
+        else:
+            self.ema_microprice = (
+                self.ema_alpha * microprice
+                + (1 - self.ema_alpha) * self.ema_microprice
+            )
+        # Mean-revert short-term ema microprice moves instead of raw mid moves.
+        return self.ema_microprice
 
     def act(self, state: TradingState) -> None:
         buy_orders, sell_orders = self._get_sorted_orders(state)
@@ -433,7 +440,6 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         )
 
         self.fair_value = self._estimate_fair_value(microprice)
-        self.prev_microprice = microprice
 
         fair_value = self.fair_value if self.fair_value is not None else current_mid
 
@@ -468,8 +474,7 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         # 2) PASSIVE QUOTING
         # ============================================================
 
-        # Default: improve best bid/ask by 1 tick, stay near fair value.
-        fair_int = int(fair_value - trend_bias) # mean reversion trend bias : if > 0 then it'll go down so we substract
+        fair_int = int(fair_value - trend_bias)
         bid_quote = min(best_bid + 1, fair_int - 1)
         ask_quote = max(best_ask - 1, fair_int + 1)
 
@@ -481,7 +486,6 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         base_bid_size = buy_left
         base_ask_size = sell_left
 
-        # Adjust based on trend
         if trend_bias > 0:
             bid_size = max(base_bid_size // 2, 6)  # buy less
             ask_size = base_ask_size  # sell more
@@ -501,7 +505,7 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
     def save(self) -> JSON:
         return {
             "fair_value": self.fair_value,
-            "prev_microprice": self.prev_microprice,
+            "ema_microprice": self.ema_microprice,
             "prev_mid_prices": self.prev_mid_prices,
         }
 
@@ -513,14 +517,14 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         if isinstance(fair_value, (int, float)):
             self.fair_value = float(fair_value)
 
-        prev_microprice = data.get("prev_microprice")
-        if isinstance(prev_microprice, (int, float)):
-            self.prev_microprice = float(prev_microprice)
+        ema_microprice = data.get("ema_microprice")
+        if isinstance(ema_microprice, (int, float)):
+            self.ema_microprice = float(ema_microprice)
         else:
-            # Backward compatibility with older saved state.
-            prev_mid = data.get("prev_mid")
-            if isinstance(prev_mid, (int, float)):
-                self.prev_microprice = float(prev_mid)
+            # backward compatibility with older saved state
+            prev_microprice = data.get("prev_microprice")
+            if isinstance(prev_microprice, (int, float)):
+                self.ema_microprice = float(prev_microprice)
 
         mid_history = data.get("prev_mid_prices")
         if isinstance(mid_history, list):
