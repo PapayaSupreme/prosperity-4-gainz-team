@@ -1,4 +1,4 @@
-#emerald changed: take_edge, inventory_kew descreased, passive_clip and size increased
+#emerald changed: no ar for tomato fair price
 import json
 from abc import abstractmethod
 from typing import Any
@@ -356,20 +356,15 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         self.mid_history: list[float] = []
         self.ar_beta = 0.95  # momentum coefficient: ~95% of prev price carries forward
         self.ar_alpha = 0.05  # mean-reversion coefficient: 5% pull toward long-term mean
+        self.alpha = 0.08
 
         # Inventory bands (same as Emeralds).
         self.soft_pos = 40
         self.hard_pos = 70
 
     def _estimate_fair_value(self, current_mid: float) -> float:
-        """AR(1)-inspired fair value: blend of history momentum and current observation."""
-        if not self.mid_history:
-            return current_mid
-
-        # Simple AR(1): fair_value = ar_beta * prev_mid + ar_alpha * current_mid
-        prev_mid = self.mid_history[-1]
-        estimated = self.ar_beta * prev_mid + self.ar_alpha * current_mid
-        return estimated
+        """current midprice"""
+        return current_mid
 
     def act(self, state: TradingState) -> None:
         depth = state.order_depths[self.symbol]

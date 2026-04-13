@@ -1,4 +1,4 @@
-#emerald changed: take_edge, inventory_kew descreased, passive_clip and size increased
+#from v1.13: linreg for tomato random walk estimation
 import json
 from abc import abstractmethod
 from typing import Any
@@ -351,25 +351,60 @@ class EmeraldsMarketMaker(Strategy):
 class TomatoesAdaptiveMarketMaker(StatefulStrategy):
     def __init__(self, symbol: Symbol, limit: int) -> None:
         super().__init__(symbol, limit)
-        # Simple AR(1) model: fair_value ≈ alpha + beta * prev_mid + drift
         self.fair_value: float | None = None
-        self.mid_history: list[float] = []
-        self.ar_beta = 0.95  # momentum coefficient: ~95% of prev price carries forward
-        self.ar_alpha = 0.05  # mean-reversion coefficient: 5% pull toward long-term mean
+        self.prev_mid: float | None = None
+
+        # Fallback mean-reversion coeff when regression history is too short.
+        self.k = 0.3
+
+        # Recent mid-price changes for tiny linear regression on deltas.
+        self.delta_history: list[float] = []
+        self.reg_window = 8          # use last N deltas
+        self.max_pred_delta = 2.0    # clip prediction to avoid unstable quotes
 
         # Inventory bands (same as Emeralds).
         self.soft_pos = 40
         self.hard_pos = 70
 
     def _estimate_fair_value(self, current_mid: float) -> float:
-        """AR(1)-inspired fair value: blend of history momentum and current observation."""
-        if not self.mid_history:
+        # No previous mid yet -> nothing to estimate.
+        if self.prev_mid is None:
             return current_mid
 
-        # Simple AR(1): fair_value = ar_beta * prev_mid + ar_alpha * current_mid
-        prev_mid = self.mid_history[-1]
-        estimated = self.ar_beta * prev_mid + self.ar_alpha * current_mid
-        return estimated
+        current_delta = current_mid - self.prev_mid
+
+        # Update delta history first.
+        self.delta_history.append(current_delta)
+        if len(self.delta_history) > self.reg_window:
+            self.delta_history.pop(0)
+
+        # Need enough points for a meaningful regression.
+        # We regress:
+        #   delta_t = a + b * delta_{t-1}
+        # then predict next delta from current delta.
+        if len(self.delta_history) >= 5:
+            y = self.delta_history[1:]   # current deltas
+            x = self.delta_history[:-1]  # previous deltas
+
+            n = len(x)
+            mean_x = sum(x) / n
+            mean_y = sum(y) / n
+
+            var_x = sum((xi - mean_x) ** 2 for xi in x)
+            if var_x > 1e-9:
+                cov_xy = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
+                b = cov_xy / var_x
+                a = mean_y - b * mean_x
+
+                predicted_delta = a + b * current_delta
+
+                # Clip prediction so one noisy fit cannot wreck quoting.
+                predicted_delta = max(-self.max_pred_delta, min(self.max_pred_delta, predicted_delta))
+                return current_mid + predicted_delta
+
+        # Fallback: simple mean-reversion if regression history is too short
+        # or regression is degenerate.
+        return current_mid - self.k * current_delta
 
     def act(self, state: TradingState) -> None:
         depth = state.order_depths[self.symbol]
@@ -385,23 +420,18 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         best_ask = sell_orders[0][0]
         current_mid = (best_bid + best_ask) / 2
 
-        # Update mid history and estimate fair value via AR(1)
-        self.mid_history.append(current_mid)
-        if len(self.mid_history) > 50:
-            self.mid_history.pop(0)
+        self.fair_value = self._estimate_fair_value(current_mid)
+        self.prev_mid = current_mid
 
-        if self.fair_value is None:
-            self.fair_value = current_mid
-        else:
-            self.fair_value = self._estimate_fair_value(current_mid)
+        fair_value = self.fair_value if self.fair_value is not None else current_mid
 
         # ============================================================
         # 1) TAKE OBVIOUS MISPRICINGS AROUND ESTIMATED FAIR VALUE
         # ============================================================
 
-        # Tighter thresholds than Emeralds since tomato fair value may drift.
-        take_buy_price = self.fair_value - 1
-        take_sell_price = self.fair_value + 1
+        # Take thresholds around current fair value.
+        take_buy_price = fair_value - 1
+        take_sell_price = fair_value + 1
 
         # Buy asks that are too cheap relative to fair value.
         for ask_price, ask_volume in sell_orders:
@@ -432,12 +462,14 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         best_ask = sell_orders[0][0]
 
         # ============================================================
-        # 2) PASSIVE QUOTING: SIMPLE, INVENTORY-AWARE (like Emeralds)
+        # 2) PASSIVE QUOTING: SIMPLE, INVENTORY-AWARE
         # ============================================================
 
         # Default: improve best bid/ask by 1 tick, stay near fair value.
-        bid_quote = min(best_bid + 1, int(self.fair_value) - 1)
-        ask_quote = max(best_ask - 1, int(self.fair_value) + 1)
+        fair_int = int(fair_value)
+
+        bid_quote = min(best_bid + 1, fair_int - 1)
+        ask_quote = max(best_ask - 1, fair_int + 1)
 
         # Safety: never cross.
         bid_quote = min(bid_quote, best_ask - 1)
@@ -455,12 +487,12 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
             # Lean away from current inventory.
             if position > 0:
                 # long -> less aggressive on bid, more aggressive on ask
-                bid_quote = min(best_bid, int(self.fair_value) - 1)
-                ask_quote = max(best_bid + 1, int(self.fair_value) + 1)
+                bid_quote = min(best_bid, fair_int - 1)
+                ask_quote = max(best_bid + 1, fair_int + 1)
             elif position < 0:
                 # short -> more aggressive on bid, less aggressive on ask
-                bid_quote = min(best_ask - 1, int(self.fair_value) - 1)
-                ask_quote = max(best_ask, int(self.fair_value) + 1)
+                bid_quote = min(best_ask - 1, fair_int - 1)
+                ask_quote = max(best_ask, fair_int + 1)
 
         else:
             # Very stretched inventory: strongly prioritize flattening.
@@ -470,18 +502,19 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
             if position > 0:
                 # very long -> stop competing on bid, sell more aggressively
                 bid_size = 0
-                ask_quote = max(best_bid + 1, int(self.fair_value))
+                ask_quote = max(best_bid + 1, fair_int)
                 ask_size = min(sell_left, 40)
 
             elif position < 0:
                 # very short -> stop competing on ask, buy more aggressively
                 ask_size = 0
-                bid_quote = min(best_ask - 1, int(self.fair_value))
                 bid_size = min(buy_left, 40)
+                bid_quote = min(best_ask - 1, fair_int)
 
         # ============================================================
         # 3) POST PASSIVE ORDERS
         # ============================================================
+
         if buy_left > 0 and 'bid_size' in locals() and bid_size > 0:
             self.buy(bid_quote, min(buy_left, bid_size))
 
@@ -491,7 +524,8 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
     def save(self) -> JSON:
         return {
             "fair_value": self.fair_value,
-            "mid_history": self.mid_history,
+            "prev_mid": self.prev_mid,
+            "delta_history": self.delta_history,
         }
 
     def load(self, data: JSON) -> None:
@@ -502,9 +536,14 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         if isinstance(fair_value, (int, float)):
             self.fair_value = float(fair_value)
 
-        mid_history = data.get("mid_history")
-        if isinstance(mid_history, list):
-            self.mid_history = [float(value) for value in mid_history][-50:]
+        prev_mid = data.get("prev_mid")
+        if isinstance(prev_mid, (int, float)):
+            self.prev_mid = float(prev_mid)
+
+        delta_history = data.get("delta_history")
+        if isinstance(delta_history, list):
+            self.delta_history = [float(x) for x in delta_history][-self.reg_window:]
+
 
 
 class Trader:

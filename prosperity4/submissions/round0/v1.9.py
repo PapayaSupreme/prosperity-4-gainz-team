@@ -1,4 +1,4 @@
-#emerald changed: take_edge, inventory_kew descreased, passive_clip and size increased
+#go from 3 regimes to linear offer size
 import json
 from abc import abstractmethod
 from typing import Any
@@ -216,6 +216,9 @@ class EmeraldsMarketMaker(Strategy):
         # Inventory bands.
         self.soft_pos = 40
         self.hard_pos = 70
+        # Max quote shift in ticks when position reaches +/- limit.
+        self.skew_strength = 6.0
+
 
     def act(self, state: TradingState) -> None:
         depth = state.order_depths[self.symbol]
@@ -231,7 +234,7 @@ class EmeraldsMarketMaker(Strategy):
         # 1) TAKE OBVIOUS MISPRICINGS AROUND KNOWN FAIR = 10000
         # ============================================================
 
-        # Buy all asks <= 9999, subject to position limit.
+        # Buy all asks <= 9998, subject to position limit.
         for ask_price, ask_volume in sell_orders:
             if buy_left <= 0 or ask_price > self.take_buy_price:
                 break
@@ -240,7 +243,7 @@ class EmeraldsMarketMaker(Strategy):
             buy_left -= size
             position += size
 
-        # Sell all bids >= 10001, subject to position limit.
+        # Sell all bids >= 10002, subject to position limit.
         for bid_price, bid_volume in buy_orders:
             if sell_left <= 0 or bid_price < self.take_sell_price:
                 break
@@ -260,20 +263,30 @@ class EmeraldsMarketMaker(Strategy):
         best_ask = sell_orders[0][0]
 
         # ============================================================
-        # 2) PASSIVE QUOTING: SIMPLE, DISCRETE, INVENTORY-AWARE
+        # 2) PASSIVE QUOTING: SMOOTH INVENTORY SKEW + BAND-BASED SIZE
         # ============================================================
 
-        # Default idea:
-        # - improve best bid by 1 tick if still below fair
-        # - improve best ask by 1 tick if still above fair
-        bid_quote = min(best_bid + 1, self.fair_value - 1)
-        ask_quote = max(best_ask - 1, self.fair_value + 1)
+        # Base quotes around fair value and current top of book.
+        base_bid_quote = min(best_bid + 1, self.fair_value - 1)
+        base_ask_quote = max(best_ask - 1, self.fair_value + 1)
 
-        # Safety: never cross.
+        # Long inventory -> shift both quotes down; short inventory -> shift both up.
+        inventory_ratio = position / self.limit
+        skew = inventory_ratio * self.skew_strength
+        skew_ticks = int(round(skew))
+
+        bid_quote = base_bid_quote - skew_ticks
+        ask_quote = base_ask_quote - skew_ticks
+
+        # Safety: never cross and keep a minimum one-tick spread.
         bid_quote = min(bid_quote, best_ask - 1)
         ask_quote = max(ask_quote, best_bid + 1)
+        if bid_quote >= ask_quote:
+            mid_quote = (bid_quote + ask_quote) // 2
+            bid_quote = min(mid_quote, best_ask - 1)
+            ask_quote = max(mid_quote + 1, best_bid + 1)
 
-        # Inventory-dependent quote size and aggressiveness.
+        # Keep smooth skew for normal/medium, only reduce size by inventory band.
         if abs(position) < self.soft_pos:
             bid_size = min(buy_left, 32)
             ask_size = min(sell_left, 32)
@@ -282,7 +295,7 @@ class EmeraldsMarketMaker(Strategy):
             bid_size = min(buy_left, 20)
             ask_size = min(sell_left, 20)
 
-            # Lean away from current inventory.
+            """"# Lean away from current inventory.
             if position > 0:
                 # long -> less aggressive on bid, more aggressive on ask
                 bid_quote = min(best_bid, self.fair_value - 1)
@@ -290,7 +303,7 @@ class EmeraldsMarketMaker(Strategy):
             elif position < 0:
                 # short -> more aggressive on bid, less aggressive on ask
                 bid_quote = min(best_ask - 1, self.fair_value - 1)
-                ask_quote = max(best_ask, self.fair_value + 1)
+                ask_quote = max(best_ask, self.fair_value + 1)"""
 
         else:
             # Very stretched inventory: strongly prioritize flattening.
@@ -360,6 +373,8 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         # Inventory bands (same as Emeralds).
         self.soft_pos = 40
         self.hard_pos = 70
+        # Max quote shift in ticks when position reaches +/- limit.
+        self.skew_strength = 6.0
 
     def _estimate_fair_value(self, current_mid: float) -> float:
         """AR(1)-inspired fair value: blend of history momentum and current observation."""
@@ -395,13 +410,15 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         else:
             self.fair_value = self._estimate_fair_value(current_mid)
 
+        fair_value = self.fair_value if self.fair_value is not None else current_mid
+
         # ============================================================
         # 1) TAKE OBVIOUS MISPRICINGS AROUND ESTIMATED FAIR VALUE
         # ============================================================
 
         # Tighter thresholds than Emeralds since tomato fair value may drift.
-        take_buy_price = self.fair_value - 1
-        take_sell_price = self.fair_value + 1
+        take_buy_price = fair_value - 1
+        take_sell_price = fair_value + 1
 
         # Buy asks that are too cheap relative to fair value.
         for ask_price, ask_volume in sell_orders:
@@ -432,18 +449,30 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         best_ask = sell_orders[0][0]
 
         # ============================================================
-        # 2) PASSIVE QUOTING: SIMPLE, INVENTORY-AWARE (like Emeralds)
+        # 2) PASSIVE QUOTING: SMOOTH INVENTORY SKEW + BAND-BASED SIZE
         # ============================================================
 
-        # Default: improve best bid/ask by 1 tick, stay near fair value.
-        bid_quote = min(best_bid + 1, int(self.fair_value) - 1)
-        ask_quote = max(best_ask - 1, int(self.fair_value) + 1)
+        fair_int = int(round(fair_value))
+        base_bid_quote = min(best_bid + 1, fair_int - 1)
+        base_ask_quote = max(best_ask - 1, fair_int + 1)
 
-        # Safety: never cross.
+        # Long inventory -> shift both quotes down; short inventory -> shift both up.
+        inventory_ratio = position / self.limit
+        skew = inventory_ratio * self.skew_strength
+        skew_ticks = int(round(skew))
+
+        bid_quote = base_bid_quote - skew_ticks
+        ask_quote = base_ask_quote - skew_ticks
+
+        # Safety: never cross and keep a minimum one-tick spread.
         bid_quote = min(bid_quote, best_ask - 1)
         ask_quote = max(ask_quote, best_bid + 1)
+        if bid_quote >= ask_quote:
+            mid_quote = (bid_quote + ask_quote) // 2
+            bid_quote = min(mid_quote, best_ask - 1)
+            ask_quote = max(mid_quote + 1, best_bid + 1)
 
-        # Inventory-dependent quote size and aggressiveness.
+        # Keep smooth skew for normal/medium, only reduce size by inventory band.
         if abs(position) < self.soft_pos:
             bid_size = min(buy_left, 32)
             ask_size = min(sell_left, 32)
@@ -452,15 +481,6 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
             bid_size = min(buy_left, 20)
             ask_size = min(sell_left, 20)
 
-            # Lean away from current inventory.
-            if position > 0:
-                # long -> less aggressive on bid, more aggressive on ask
-                bid_quote = min(best_bid, int(self.fair_value) - 1)
-                ask_quote = max(best_bid + 1, int(self.fair_value) + 1)
-            elif position < 0:
-                # short -> more aggressive on bid, less aggressive on ask
-                bid_quote = min(best_ask - 1, int(self.fair_value) - 1)
-                ask_quote = max(best_ask, int(self.fair_value) + 1)
 
         else:
             # Very stretched inventory: strongly prioritize flattening.
@@ -470,13 +490,13 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
             if position > 0:
                 # very long -> stop competing on bid, sell more aggressively
                 bid_size = 0
-                ask_quote = max(best_bid + 1, int(self.fair_value))
+                ask_quote = max(best_bid + 1, fair_int)
                 ask_size = min(sell_left, 40)
 
             elif position < 0:
                 # very short -> stop competing on ask, buy more aggressively
                 ask_size = 0
-                bid_quote = min(best_ask - 1, int(self.fair_value))
+                bid_quote = min(best_ask - 1, fair_int)
                 bid_size = min(buy_left, 40)
 
         # ============================================================

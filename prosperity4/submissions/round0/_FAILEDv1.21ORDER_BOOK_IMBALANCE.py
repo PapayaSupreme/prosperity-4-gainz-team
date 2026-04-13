@@ -1,4 +1,5 @@
-#emerald changed: take_edge, inventory_kew descreased, passive_clip and size increased
+# from v1.19: soft inventories on tomato
+
 import json
 from abc import abstractmethod
 from typing import Any
@@ -193,6 +194,64 @@ class Strategy:
         best_ask = min(order_depth.sell_orders.keys())
         return (best_bid + best_ask) / 2
 
+    def _get_sorted_orders(self, state: TradingState) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+        order_depth = state.order_depths[self.symbol]
+        buy_orders = sorted(order_depth.buy_orders.items(), reverse=True)
+        sell_orders = sorted(order_depth.sell_orders.items())
+        return buy_orders, sell_orders
+
+    def _get_position_capacities(self, state: TradingState) -> tuple[int, int, int]:
+        position = state.position.get(self.symbol, 0)
+        buy_left = self.limit - position
+        sell_left = self.limit + position
+        return position, buy_left, sell_left
+
+    def _take_sell_levels(
+        self,
+        sell_orders: list[tuple[int, int]],
+        buy_left: int,
+        position: int,
+        max_price: float,
+    ) -> tuple[int, int]:
+        for ask_price, ask_volume in sell_orders:
+            if buy_left <= 0 or ask_price > max_price:
+                break
+            size = min(buy_left, -ask_volume)
+            self.buy(ask_price, size)
+            buy_left -= size
+            position += size
+        return buy_left, position
+
+    def _take_buy_levels(
+        self,
+        buy_orders: list[tuple[int, int]],
+        sell_left: int,
+        position: int,
+        min_price: float,
+    ) -> tuple[int, int]:
+        for bid_price, bid_volume in buy_orders:
+            if sell_left <= 0 or bid_price < min_price:
+                break
+            size = min(sell_left, bid_volume)
+            self.sell(bid_price, size)
+            sell_left -= size
+            position -= size
+        return sell_left, position
+
+    def _post_passive_orders(
+        self,
+        buy_left: int,
+        sell_left: int,
+        bid_quote: int,
+        ask_quote: int,
+        bid_size: int,
+        ask_size: int,
+    ) -> None:
+        if buy_left > 0 and bid_size > 0:
+            self.buy(bid_quote, min(buy_left, bid_size))
+        if sell_left > 0 and ask_size > 0:
+            self.sell(ask_quote, min(sell_left, ask_size))
+
 
 class StatefulStrategy(Strategy):
     @abstractmethod
@@ -218,36 +277,15 @@ class EmeraldsMarketMaker(Strategy):
         self.hard_pos = 70
 
     def act(self, state: TradingState) -> None:
-        depth = state.order_depths[self.symbol]
-        buy_orders = sorted(depth.buy_orders.items(), reverse=True)   # highest bid first
-        sell_orders = sorted(depth.sell_orders.items())               # lowest ask first
-
-        position = state.position.get(self.symbol, 0)
-
-        buy_left = self.limit - position
-        sell_left = self.limit + position
+        buy_orders, sell_orders = self._get_sorted_orders(state)
+        position, buy_left, sell_left = self._get_position_capacities(state)
 
         # ============================================================
         # 1) TAKE OBVIOUS MISPRICINGS AROUND KNOWN FAIR = 10000
         # ============================================================
 
-        # Buy all asks <= 9999, subject to position limit.
-        for ask_price, ask_volume in sell_orders:
-            if buy_left <= 0 or ask_price > self.take_buy_price:
-                break
-            size = min(buy_left, -ask_volume)
-            self.buy(ask_price, size)
-            buy_left -= size
-            position += size
-
-        # Sell all bids >= 10001, subject to position limit.
-        for bid_price, bid_volume in buy_orders:
-            if sell_left <= 0 or bid_price < self.take_sell_price:
-                break
-            size = min(sell_left, bid_volume)
-            self.sell(bid_price, size)
-            sell_left -= size
-            position -= size
+        buy_left, position = self._take_sell_levels(sell_orders, buy_left, position, self.take_buy_price)
+        sell_left, position = self._take_buy_levels(buy_orders, sell_left, position, self.take_sell_price)
 
         # Recompute remaining capacity after aggressive fills.
         buy_left = self.limit - position
@@ -341,85 +379,98 @@ class EmeraldsMarketMaker(Strategy):
         # ============================================================
         # 4) POST PASSIVE ORDERS
         # ============================================================
-        if buy_left > 0 and 'bid_size' in locals() and bid_size > 0:
-            self.buy(bid_quote, min(buy_left, bid_size))
-
-        if sell_left > 0 and 'ask_size' in locals() and ask_size > 0:
-            self.sell(ask_quote, min(sell_left, ask_size))
+        self._post_passive_orders(buy_left, sell_left, bid_quote, ask_quote, bid_size, ask_size)
 
 
 class TomatoesAdaptiveMarketMaker(StatefulStrategy):
     def __init__(self, symbol: Symbol, limit: int) -> None:
         super().__init__(symbol, limit)
-        # Simple AR(1) model: fair_value ≈ alpha + beta * prev_mid + drift
         self.fair_value: float | None = None
-        self.mid_history: list[float] = []
-        self.ar_beta = 0.95  # momentum coefficient: ~95% of prev price carries forward
-        self.ar_alpha = 0.05  # mean-reversion coefficient: 5% pull toward long-term mean
-
-        # Inventory bands (same as Emeralds).
+        self.prev_microprice: float | None = None
+        self.prev_mid_prices = []
+        self.k = 0.3  # coeff of mean reversion
+        self.passive_clip = 20
         self.soft_pos = 40
         self.hard_pos = 70
+        self.imbalance_alpha = 1.0
 
-    def _estimate_fair_value(self, current_mid: float) -> float:
-        """AR(1)-inspired fair value: blend of history momentum and current observation."""
-        if not self.mid_history:
-            return current_mid
-
-        # Simple AR(1): fair_value = ar_beta * prev_mid + ar_alpha * current_mid
-        prev_mid = self.mid_history[-1]
-        estimated = self.ar_beta * prev_mid + self.ar_alpha * current_mid
-        return estimated
+    def _estimate_fair_value(self, microprice: float) -> float:
+        if self.prev_microprice is None:
+            return microprice
+        # Mean-revert short-term microprice moves instead of raw mid moves.
+        return microprice - self.k * (microprice - self.prev_microprice)
 
     def act(self, state: TradingState) -> None:
-        depth = state.order_depths[self.symbol]
-        buy_orders = sorted(depth.buy_orders.items(), reverse=True)   # highest bid first
-        sell_orders = sorted(depth.sell_orders.items())               # lowest ask first
+        buy_orders, sell_orders = self._get_sorted_orders(state)
+        position, buy_left, sell_left = self._get_position_capacities(state)
 
-        position = state.position.get(self.symbol, 0)
-        buy_left = self.limit - position
-        sell_left = self.limit + position
-
-        # Calculate current mid price from best bid/ask
+        # Calculate current mid-price from best bid/ask
         best_bid = buy_orders[0][0]
         best_ask = sell_orders[0][0]
         current_mid = (best_bid + best_ask) / 2
 
-        # Update mid history and estimate fair value via AR(1)
-        self.mid_history.append(current_mid)
-        if len(self.mid_history) > 50:
-            self.mid_history.pop(0)
+        self.prev_mid_prices.append(current_mid)
+        if len(self.prev_mid_prices) > 10:
+            self.prev_mid_prices.pop(0)
 
-        if self.fair_value is None:
-            self.fair_value = current_mid
-        else:
-            self.fair_value = self._estimate_fair_value(current_mid)
+        # Simple trend: last 4 mids increasing or decreasing
+        trend_bias = 0
+        if len(self.prev_mid_prices) >= 4:
+            last_4 = self.prev_mid_prices[-4:]
+            diffs = [last_4[i + 1] - last_4[i] for i in range(3)]
 
-        # ============================================================
+            pos_count = sum(d > 0 for d in diffs)
+            neg_count = sum(d < 0 for d in diffs)
+
+            if pos_count >= 2 or neg_count >= 2:
+                trend_bias = sum(diffs) / 3
+
+        # Microprice weights prices by opposite-side top-of-book volume.
+        best_bid_vol = max(0, buy_orders[0][1])
+        best_ask_vol = max(0, -sell_orders[0][1])
+
+        top_vol = best_bid_vol + best_ask_vol
+        microprice = (
+            (best_ask * best_bid_vol + best_bid * best_ask_vol) / top_vol
+            if top_vol > 0
+            else current_mid
+        )
+
+        self.fair_value = self._estimate_fair_value(microprice)
+        self.prev_microprice = microprice
+        
+        fair_value = self.fair_value if self.fair_value is not None else current_mid
+
+        # Simple imbalance in [-1, 1]
+        imbalance = (
+            (best_bid_vol - best_ask_vol) / top_vol
+            if top_vol > 0
+            else 0.0
+        )
+
+        base_fair_value = self._estimate_fair_value(microprice)
+
+        # Small bullish shift when bid side is heavier,
+        # small bearish shift when ask side is heavier.
+        fair_value = base_fair_value + self.imbalance_alpha * imbalance
+
+        self.fair_value = fair_value
+        self.prev_microprice = microprice
+
+        # ------------------------------------------------------------
         # 1) TAKE OBVIOUS MISPRICINGS AROUND ESTIMATED FAIR VALUE
-        # ============================================================
+        # ------------------------------------------------------------
 
-        # Tighter thresholds than Emeralds since tomato fair value may drift.
-        take_buy_price = self.fair_value - 1
-        take_sell_price = self.fair_value + 1
+        # No trend bias here. Test imbalance alone first.
+        take_buy_price = fair_value - 1
+        take_sell_price = fair_value + 1
 
-        # Buy asks that are too cheap relative to fair value.
-        for ask_price, ask_volume in sell_orders:
-            if buy_left <= 0 or ask_price > take_buy_price:
-                break
-            size = min(buy_left, -ask_volume)
-            self.buy(ask_price, size)
-            buy_left -= size
-            position += size
-
-        # Sell bids that are too rich relative to fair value.
-        for bid_price, bid_volume in buy_orders:
-            if sell_left <= 0 or bid_price < take_sell_price:
-                break
-            size = min(sell_left, bid_volume)
-            self.sell(bid_price, size)
-            sell_left -= size
-            position -= size
+        buy_left, position = self._take_sell_levels(
+            sell_orders, buy_left, position, take_buy_price
+        )
+        sell_left, position = self._take_buy_levels(
+            buy_orders, sell_left, position, take_sell_price
+        )
 
         # Recompute remaining capacity.
         buy_left = self.limit - position
@@ -431,67 +482,57 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         best_bid = buy_orders[0][0]
         best_ask = sell_orders[0][0]
 
-        # ============================================================
-        # 2) PASSIVE QUOTING: SIMPLE, INVENTORY-AWARE (like Emeralds)
-        # ============================================================
+        # ------------------------------------------------------------
+        # 2) PASSIVE QUOTING
+        # ------------------------------------------------------------
 
-        # Default: improve best bid/ask by 1 tick, stay near fair value.
-        bid_quote = min(best_bid + 1, int(self.fair_value) - 1)
-        ask_quote = max(best_ask - 1, int(self.fair_value) + 1)
+        fair_int = int(round(fair_value))
+        bid_quote = min(best_bid + 1, fair_int - 1)
+        ask_quote = max(best_ask - 1, fair_int + 1)
 
         # Safety: never cross.
         bid_quote = min(bid_quote, best_ask - 1)
         ask_quote = max(ask_quote, best_bid + 1)
 
-        # Inventory-dependent quote size and aggressiveness.
-        if abs(position) < self.soft_pos:
-            bid_size = min(buy_left, 32)
-            ask_size = min(sell_left, 32)
+        # ------------------------------------------------------------
+        # 3) INVENTORY-AWARE SIZING
+        # ------------------------------------------------------------
 
-        elif abs(position) < self.hard_pos:
+        if abs(position) < self.soft_pos:
             bid_size = min(buy_left, 20)
             ask_size = min(sell_left, 20)
 
-            # Lean away from current inventory.
-            if position > 0:
-                # long -> less aggressive on bid, more aggressive on ask
-                bid_quote = min(best_bid, int(self.fair_value) - 1)
-                ask_quote = max(best_bid + 1, int(self.fair_value) + 1)
-            elif position < 0:
-                # short -> more aggressive on bid, less aggressive on ask
-                bid_quote = min(best_ask - 1, int(self.fair_value) - 1)
-                ask_quote = max(best_ask, int(self.fair_value) + 1)
-
-        else:
-            # Very stretched inventory: strongly prioritize flattening.
+        elif abs(position) < self.hard_pos:
             bid_size = min(buy_left, 12)
             ask_size = min(sell_left, 12)
 
+            # Lean away from current inventory
             if position > 0:
-                # very long -> stop competing on bid, sell more aggressively
-                bid_size = 0
-                ask_quote = max(best_bid + 1, int(self.fair_value))
-                ask_size = min(sell_left, 40)
-
+                bid_size = max(bid_size // 2, 0)
             elif position < 0:
-                # very short -> stop competing on ask, buy more aggressively
+                ask_size = max(ask_size // 2, 0)
+
+        else:
+            # Very stretched inventory: prioritize flattening
+            if position > 0:
+                bid_size = 0
+                ask_size = min(sell_left, 30)
+            else:
                 ask_size = 0
-                bid_quote = min(best_ask - 1, int(self.fair_value))
-                bid_size = min(buy_left, 40)
+                bid_size = min(buy_left, 30)
 
-        # ============================================================
-        # 3) POST PASSIVE ORDERS
-        # ============================================================
-        if buy_left > 0 and 'bid_size' in locals() and bid_size > 0:
-            self.buy(bid_quote, min(buy_left, bid_size))
+        # ------------------------------------------------------------
+        # 4) POST PASSIVE ORDERS
+        # ------------------------------------------------------------
 
-        if sell_left > 0 and 'ask_size' in locals() and ask_size > 0:
-            self.sell(ask_quote, min(sell_left, ask_size))
+        self._post_passive_orders(
+            buy_left, sell_left, bid_quote, ask_quote, bid_size, ask_size
+        )
 
     def save(self) -> JSON:
         return {
             "fair_value": self.fair_value,
-            "mid_history": self.mid_history,
+            "prev_microprice": self.prev_microprice,
         }
 
     def load(self, data: JSON) -> None:
@@ -502,9 +543,42 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         if isinstance(fair_value, (int, float)):
             self.fair_value = float(fair_value)
 
-        mid_history = data.get("mid_history")
+        prev_microprice = data.get("prev_microprice")
+        if isinstance(prev_microprice, (int, float)):
+            self.prev_microprice = float(prev_microprice)
+        else:
+            # Backward compatibility with older saved state.
+            prev_mid = data.get("prev_mid")
+            if isinstance(prev_mid, (int, float)):
+                self.prev_microprice = float(prev_mid)
+    def save(self) -> JSON:
+        return {
+            "fair_value": self.fair_value,
+            "prev_microprice": self.prev_microprice,
+            "prev_mid_prices": self.prev_mid_prices,
+        }
+
+    def load(self, data: JSON) -> None:
+        if not isinstance(data, dict):
+            return
+
+        fair_value = data.get("fair_value")
+        if isinstance(fair_value, (int, float)):
+            self.fair_value = float(fair_value)
+
+        prev_microprice = data.get("prev_microprice")
+        if isinstance(prev_microprice, (int, float)):
+            self.prev_microprice = float(prev_microprice)
+        else:
+            # Backward compatibility with older saved state.
+            prev_mid = data.get("prev_mid")
+            if isinstance(prev_mid, (int, float)):
+                self.prev_microprice = float(prev_mid)
+
+        mid_history = data.get("prev_mid_prices")
         if isinstance(mid_history, list):
-            self.mid_history = [float(value) for value in mid_history][-50:]
+            self.prev_mid_prices = [float(x) for x in mid_history]
+
 
 
 class Trader:
