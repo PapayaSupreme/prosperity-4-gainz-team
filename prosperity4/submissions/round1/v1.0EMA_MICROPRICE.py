@@ -1,14 +1,4 @@
-# 2591 - from v1.19: ema(microprice) on tomato
-# 100MC: 2025-04-12_15-39-52 - PnL: 15 086, STD: 2349, Median: 14 887
-# 1MC: PnL: 30 254, Sharpe: 23, Calmar: 21
-"""SET             DAY    TICKS  OWN_TRADES    FINAL_PNL  RUN_DIR
-D-2              -2    10000         669     15547.50  runs/backtest-1776159448291-tutorial-day-2
-D-1              -1    10000         715     15109.00  runs/backtest-1776159448291-tutorial-day-1
-SUB              -1     2000         120      2579.50  runs/backtest-1776159448291-tutorial-submission-day-1
 
-PRODUCT        D-2        D-1        SUB
-TOM        8365.50    7346.00    1529.50
-EMR        7182.00    7763.00    1050.00"""
 import json
 from abc import abstractmethod
 from typing import Any
