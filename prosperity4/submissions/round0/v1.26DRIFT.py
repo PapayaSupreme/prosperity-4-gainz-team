@@ -1,14 +1,6 @@
-# 2591 - from v1.19: ema(microprice) on tomato
-# 100MC: 2025-04-12_15-39-52 - PnL: 15 086, STD: 2349, Median: 14 887
-# 1MC: PnL: 30 254, Sharpe: 23, Calmar: 21
-"""SET             DAY    TICKS  OWN_TRADES    FINAL_PNL  RUN_DIR
-D-2              -2    10000         669     15547.50  runs/backtest-1776159448291-tutorial-day-2
-D-1              -1    10000         715     15109.00  runs/backtest-1776159448291-tutorial-day-1
-SUB              -1     2000         120      2579.50  runs/backtest-1776159448291-tutorial-submission-day-1
-
-PRODUCT        D-2        D-1        SUB
-TOM        8365.50    7346.00    1529.50
-EMR        7182.00    7763.00    1050.00"""
+# 2579 - from v1.22: drift as spread skew
+# 100MC: 2024-04-13_14-51-48 - PnL: 15 020, STD: 2374, Median: 15 019
+# 1MC: PnL: 30 095, Sharpe: 24, Calmar: 21
 import json
 from abc import abstractmethod
 from typing import Any
@@ -400,6 +392,9 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         self.microprice_alpha = 0.3
         self.ema_microprice: float | None = None
         self.ema_alpha = 0.6
+        self.drift_ema: float = 0.0
+        self.drift_alpha = 0.3
+        self.drift_skew = 1.0
 
     def _estimate_fair_value(self, microprice: float) -> float:
         if self.ema_microprice is None:
@@ -447,6 +442,19 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
             else current_mid
         )
 
+        # drift compute, used to skew book
+        if self.prev_microprice is None:
+            drift = 0.0
+        else:
+            drift = microprice - self.prev_microprice
+
+        self.drift_ema = (
+            self.drift_alpha * drift
+            + (1 - self.drift_alpha) * self.drift_ema
+        )
+
+        self.prev_microprice = microprice
+
         self.fair_value = self._estimate_fair_value(microprice)
 
         fair_value = self.fair_value if self.fair_value is not None else current_mid
@@ -458,12 +466,12 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         # Take thresholds around current fair value, taking into account trend bias.
         take_buy_price = fair_value - 1 # THE HIGHER, THE EASIER. THIS IS THE PRICE I WANT TO BUY MY STOCK FOR
         take_sell_price = fair_value + 1 # THE LOWER, THE EASIER. THIS IS THE PRICE I WANT TO SELL MY STOCK FOR
-        if trend_bias > 0: # market is up, expect a reversion, harder to buy, bid price--
+        """if trend_bias > 0: # market is up, expect a reversion, harder to buy, bid price--
             take_buy_price -= 1
             take_sell_price -= 1
         elif trend_bias < 0: # market is down, expect a reversion, harder to sell, ask price++
             take_buy_price += 1
-            take_sell_price += 1
+            take_sell_price += 1"""
 
         buy_left, position = self._take_sell_levels(sell_orders, buy_left, position, take_buy_price)
         sell_left, position = self._take_buy_levels(buy_orders, sell_left, position, take_sell_price)
@@ -482,9 +490,15 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         # 2) PASSIVE QUOTING
         # ============================================================
 
-        fair_int = int(fair_value - trend_bias)
+        # fair_int = int(fair_value - trend_bias)
+        fair_int = int(fair_value)
         bid_quote = min(best_bid + 1, fair_int - 1)
         ask_quote = max(best_ask - 1, fair_int + 1)
+
+        # use drift to influence quotes by heading to the opposite direction (expected to mean reverse)
+        skew = - self.drift_skew * self.drift_ema
+        bid_quote += int(round(skew))
+        ask_quote += int(round(skew))
 
         # Safety: never cross.
         bid_quote = min(bid_quote, best_ask - 1)
@@ -515,11 +529,21 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
             "fair_value": self.fair_value,
             "ema_microprice": self.ema_microprice,
             "prev_mid_prices": self.prev_mid_prices,
+            "prev_microprice": self.prev_microprice,
+            "drift_ema": self.drift_ema,
         }
 
     def load(self, data: JSON) -> None:
         if not isinstance(data, dict):
             return
+
+        prev_microprice = data.get("prev_microprice")
+        if isinstance(prev_microprice, (int, float)):
+            self.prev_microprice = float(prev_microprice)
+
+        drift_ema = data.get("drift_ema")
+        if isinstance(drift_ema, (int, float)):
+            self.drift_ema = float(drift_ema)
 
         fair_value = data.get("fair_value")
         if isinstance(fair_value, (int, float)):
@@ -537,6 +561,10 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         mid_history = data.get("prev_mid_prices")
         if isinstance(mid_history, list):
             self.prev_mid_prices = [float(x) for x in mid_history]
+
+
+
+
 
 
 

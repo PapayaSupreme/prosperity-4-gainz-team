@@ -1,4 +1,4 @@
-# from v1.24: z_score now computed from residuals (microprice - ema) not microprice and removes its value
+# 2512 - from v1.24: z_score now computed from residuals (microprice - ema) not microprice and removes its value
 # 100MC: 2026-04-12_15-34-39 - PnL: 15 097, STD: 2330, Median: 14 951
 # 1MC: PnL: 30 219, Sharpe: 39.6, Calmar: 23.2
 import json

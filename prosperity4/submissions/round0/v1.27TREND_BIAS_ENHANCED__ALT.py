@@ -1,13 +1,13 @@
-# 2591 - from v1.19: ema(microprice) on tomato
-# 100MC: 2025-04-12_15-39-52 - PnL: 15 086, STD: 2349, Median: 14 887
-# 1MC: PnL: 30 254, Sharpe: 23, Calmar: 21
+# 2543 - from v 1.22(?): trend now influence quotes by its value and not a flat 1
+# 100MC: 2026-04-13_18-06-47 - PnL: 15 354, STD: 2184, Median: 15 308
+# 1MC: PnL: 30 830, Sharpe: 57, Calmar: 30
 """SET             DAY    TICKS  OWN_TRADES    FINAL_PNL  RUN_DIR
-D-2              -2    10000         669     15547.50  runs/backtest-1776159448291-tutorial-day-2
-D-1              -1    10000         715     15109.00  runs/backtest-1776159448291-tutorial-day-1
-SUB              -1     2000         120      2579.50  runs/backtest-1776159448291-tutorial-submission-day-1
+D-2              -2    10000         671     15562.50  runs/backtest-1776159856769-tutorial-day-2
+D-1              -1    10000         724     15567.00  runs/backtest-1776159856769-tutorial-day-1
+SUB              -1     2000         121      2541.50  runs/backtest-1776159856769-tutorial-submission-day-1
 
 PRODUCT        D-2        D-1        SUB
-TOM        8365.50    7346.00    1529.50
+TOM        8380.50    7804.00    1491.50
 EMR        7182.00    7763.00    1050.00"""
 import json
 from abc import abstractmethod
@@ -459,11 +459,11 @@ class TomatoesAdaptiveMarketMaker(StatefulStrategy):
         take_buy_price = fair_value - 1 # THE HIGHER, THE EASIER. THIS IS THE PRICE I WANT TO BUY MY STOCK FOR
         take_sell_price = fair_value + 1 # THE LOWER, THE EASIER. THIS IS THE PRICE I WANT TO SELL MY STOCK FOR
         if trend_bias > 0: # market is up, expect a reversion, harder to buy, bid price--
-            take_buy_price -= 1
-            take_sell_price -= 1
+            take_buy_price -= max(1, round(trend_bias))
+            take_sell_price -= max(1, round(trend_bias))
         elif trend_bias < 0: # market is down, expect a reversion, harder to sell, ask price++
-            take_buy_price += 1
-            take_sell_price += 1
+            take_buy_price += max(1, round(trend_bias))
+            take_sell_price += max(1, round(trend_bias))
 
         buy_left, position = self._take_sell_levels(sell_orders, buy_left, position, take_buy_price)
         sell_left, position = self._take_buy_levels(buy_orders, sell_left, position, take_sell_price)
