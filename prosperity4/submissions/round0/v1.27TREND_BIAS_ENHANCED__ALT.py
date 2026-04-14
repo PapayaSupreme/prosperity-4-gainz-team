@@ -1,6 +1,14 @@
 # 2543 - from v 1.22(?): trend now influence quotes by its value and not a flat 1
 # 100MC: 2026-04-13_18-06-47 - PnL: 15 354, STD: 2184, Median: 15 308
 # 1MC: PnL: 30 830, Sharpe: 57, Calmar: 30
+"""SET             DAY    TICKS  OWN_TRADES    FINAL_PNL  RUN_DIR
+D-2              -2    10000         671     15562.50  runs/backtest-1776159856769-tutorial-day-2
+D-1              -1    10000         724     15567.00  runs/backtest-1776159856769-tutorial-day-1
+SUB              -1     2000         121      2541.50  runs/backtest-1776159856769-tutorial-submission-day-1
+
+PRODUCT        D-2        D-1        SUB
+TOM        8380.50    7804.00    1491.50
+EMR        7182.00    7763.00    1050.00"""
 import json
 from abc import abstractmethod
 from typing import Any
