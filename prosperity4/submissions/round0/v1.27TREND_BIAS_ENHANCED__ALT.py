@@ -1,4 +1,4 @@
-# 2591 - from v1.19: ema(microprice) on tomato
+# 2543 - from v 1.22(?): trend now influence quotes by its value and not a flat 1
 # 100MC: 2026-04-13_18-06-47 - PnL: 15 354, STD: 2184, Median: 15 308
 # 1MC: PnL: 30 830, Sharpe: 57, Calmar: 30
 import json
