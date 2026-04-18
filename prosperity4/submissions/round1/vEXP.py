@@ -1,5 +1,4 @@
-# INTARIAN_PEPPER_ROOT    239423.00
-# ASH_COATED_OSMIUM            0.00
+
 import json
 from abc import abstractmethod
 from typing import Any
@@ -266,38 +265,45 @@ class StatefulStrategy(Strategy):
 class IntarianMarketMaker(StatefulStrategy):
     def __init__(self, symbol: Symbol, limit: int) -> None:
         super().__init__(symbol, limit)
-        self.fair_value: float = 10000.0
+
+        self.fair_value: float = 0.0
+        self.take_buy_price: float = 0.0
+        self.take_sell_price: float = 0.0
+
+        self.last_timestamp: int | None = None
+        self.time_offset: int = 0
+
+        # Inventory bands.
         self.soft_pos = 40
         self.hard_pos = 70
-
-    def _update_fair_value(self) -> None:
-        self.fair_value += 100
 
     def act(self, state: TradingState) -> None:
         buy_orders, sell_orders = self._get_sorted_orders(state)
         position, buy_left, sell_left = self._get_position_capacities(state)
 
-        # Update non-resetting fair value
-        self._update_fair_value()
+        # Detect day reset: timestamp jumps backward to 0 on a new trading day.
+        if self.last_timestamp is not None and state.timestamp < self.last_timestamp:
+            self.time_offset += self.last_timestamp + 1
 
-        fair_int = int(self.fair_value)
+        global_time_index = self.time_offset + state.timestamp
+        self.last_timestamp = state.timestamp
 
-        # Hard thresholds around fair
-        take_buy_price = fair_int - 1
-        take_sell_price = fair_int + 1
+        # INTARIAN_PEPPER_ROOT fair value:
+        # fair(t) = 10000 + global_time_index + 0.001
+        self.fair_value = 10_000 + global_time_index + 0.001
+
+        # Hard thresholds around the time-varying fair value.
+        self.take_buy_price = self.fair_value - 1
+        self.take_sell_price = self.fair_value + 1
 
         # ============================================================
         # 1) TAKE OBVIOUS MISPRICINGS AROUND KNOWN FAIR
         # ============================================================
 
-        buy_left, position = self._take_sell_levels(
-            sell_orders, buy_left, position, take_buy_price
-        )
-        sell_left, position = self._take_buy_levels(
-            buy_orders, sell_left, position, take_sell_price
-        )
+        buy_left, position = self._take_sell_levels(sell_orders, buy_left, position, self.take_buy_price)
+        sell_left, position = self._take_buy_levels(buy_orders, sell_left, position, self.take_sell_price)
 
-        # Recompute remaining capacity after aggressive fills
+        # Recompute remaining capacity after aggressive fills.
         buy_left = self.limit - position
         sell_left = self.limit + position
 
@@ -308,16 +314,20 @@ class IntarianMarketMaker(StatefulStrategy):
         best_ask = sell_orders[0][0]
 
         # ============================================================
-        # 2) PASSIVE QUOTING
+        # 2) PASSIVE QUOTING: SIMPLE, DISCRETE, INVENTORY-AWARE
         # ============================================================
 
-        bid_quote = min(best_bid + 1, fair_int - 1)
-        ask_quote = max(best_ask - 1, fair_int + 1)
+        # Default idea:
+        # - improve best bid by 1 tick if still below fair
+        # - improve best ask by 1 tick if still above fair
+        bid_quote = min(best_bid + 1, self.fair_value - 1)
+        ask_quote = max(best_ask - 1, self.fair_value + 1)
 
-        # Never cross
+        # Safety: never cross.
         bid_quote = min(bid_quote, best_ask - 1)
         ask_quote = max(ask_quote, best_bid + 1)
 
+        # Inventory-dependent quote size and aggressiveness.
         if abs(position) < self.soft_pos:
             bid_size = min(buy_left, 32)
             ask_size = min(sell_left, 32)
@@ -326,36 +336,41 @@ class IntarianMarketMaker(StatefulStrategy):
             bid_size = min(buy_left, 20)
             ask_size = min(sell_left, 20)
 
+            # Lean away from current inventory.
             if position > 0:
-                # long -> bid less aggressively, ask more aggressively
-                bid_quote = min(best_bid, fair_int - 1)
-                ask_quote = max(best_bid + 1, fair_int + 1)
+                # long -> less aggressive on bid, more aggressive on ask
+                bid_quote = min(best_bid, self.fair_value - 1)
+                ask_quote = max(best_bid + 1, self.fair_value + 1)
             elif position < 0:
-                # short -> bid more aggressively, ask less aggressively
-                bid_quote = min(best_ask - 1, fair_int - 1)
-                ask_quote = max(best_ask, fair_int + 1)
+                # short -> more aggressive on bid, less aggressive on ask
+                bid_quote = min(best_ask - 1, self.fair_value - 1)
+                ask_quote = max(best_ask, self.fair_value + 1)
 
         else:
+            # Very stretched inventory: strongly prioritize flattening.
             bid_size = min(buy_left, 12)
             ask_size = min(sell_left, 12)
 
             if position > 0:
+                # very long -> stop competing on bid, sell more aggressively
                 bid_size = 0
-                ask_quote = max(best_bid + 1, fair_int)
+                ask_quote = max(best_bid + 1, self.fair_value)
                 ask_size = min(sell_left, 40)
 
             elif position < 0:
+                # very short -> stop competing on ask, buy more aggressively
                 ask_size = 0
-                bid_quote = min(best_ask - 1, fair_int)
+                bid_quote = min(best_ask - 1, self.fair_value)
                 bid_size = min(buy_left, 40)
 
         # ============================================================
-        # 3) OPTIONAL INVENTORY FLATTENING AT FAIR
+        # 3) OPTIONAL INVENTORY FLATTENING AT FAIR WHEN BOOK TOUCHES IT
         # ============================================================
 
+        # If fair is directly tradable and we are imbalanced, use it.
         if position > 0 and sell_left > 0:
             for bid_price, bid_volume in buy_orders:
-                if bid_price == fair_int:
+                if bid_price == self.fair_value:
                     size = min(position, sell_left, bid_volume)
                     if size > 0:
                         self.sell(bid_price, size)
@@ -363,9 +378,9 @@ class IntarianMarketMaker(StatefulStrategy):
                         position -= size
                     break
 
-        elif position < 0 and buy_left > 0:
+        elif position < 0 < buy_left:
             for ask_price, ask_volume in sell_orders:
-                if ask_price == fair_int:
+                if ask_price == self.fair_value:
                     size = min(-position, buy_left, -ask_volume)
                     if size > 0:
                         self.buy(ask_price, size)
@@ -373,21 +388,20 @@ class IntarianMarketMaker(StatefulStrategy):
                         position += size
                     break
 
-        # Recompute after flattening
+        # Recompute after any flattening.
         buy_left = self.limit - position
         sell_left = self.limit + position
 
         # ============================================================
         # 4) POST PASSIVE ORDERS
         # ============================================================
-
-        self._post_passive_orders(
-            buy_left, sell_left, bid_quote, ask_quote, bid_size, ask_size
-        )
+        self._post_passive_orders(buy_left, sell_left, bid_quote, ask_quote, bid_size, ask_size)
 
     def save(self) -> JSON:
         return {
             "fair_value": self.fair_value,
+            "last_timestamp": self.last_timestamp,
+            "time_offset": self.time_offset,
         }
 
     def load(self, data: JSON) -> None:
@@ -397,6 +411,14 @@ class IntarianMarketMaker(StatefulStrategy):
         fair_value = data.get("fair_value")
         if isinstance(fair_value, (int, float)):
             self.fair_value = float(fair_value)
+
+        last_timestamp = data.get("last_timestamp")
+        if isinstance(last_timestamp, int):
+            self.last_timestamp = last_timestamp
+
+        time_offset = data.get("time_offset")
+        if isinstance(time_offset, int):
+            self.time_offset = time_offset
 
 
 class TomatoesAdaptiveMarketMaker(StatefulStrategy):
